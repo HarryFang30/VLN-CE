@@ -10,40 +10,35 @@ SIMULATOR:
     GPU_DEVICE_ID: -1
     ALLOW_SLIDING: True
   RGB_SENSOR:
-    WIDTH: 224
-    HEIGHT: 224
-    HFOV: 90
+    WIDTH: 640
+    HEIGHT: 480
+    SENSOR_SUBTYPE: EQUIRECTANGULAR
     POSITION: [0, 1.25, 0]
-    TYPE: HabitatSimRGBSensor
+    TYPE: HabitatSimEquirectangularRGBSensor
   DEPTH_SENSOR:
-    WIDTH: 256
-    HEIGHT: 256
+    WIDTH: 640
+    HEIGHT: 480
+    SENSOR_SUBTYPE: EQUIRECTANGULAR
+    MIN_DEPTH: 0.0
+    MAX_DEPTH: 10.0
     POSITION: [0, 1.25, 0]
+    TYPE: HabitatSimEquirectangularDepthSensor
 TASK:
   TYPE: VLN-v0
   SUCCESS_DISTANCE: 3.0
-  SENSORS: [
-    INSTRUCTION_SENSOR,
-    SHORTEST_PATH_SENSOR,
-    VLN_ORACLE_PROGRESS_SENSOR
-  ]
+  SENSORS: []
   INSTRUCTION_SENSOR_UUID: instruction
   POSSIBLE_ACTIONS: [STOP, MOVE_FORWARD, TURN_LEFT, TURN_RIGHT]
+  # Only use basic measurements that don't require torch
   MEASUREMENTS: [
     DISTANCE_TO_GOAL,
     SUCCESS,
-    SPL,
-    NDTW,
-    PATH_LENGTH,
-    ORACLE_SUCCESS,
-    STEPS_TAKEN
+    SPL
   ]
   SUCCESS:
     SUCCESS_DISTANCE: 3.0
   SPL:
     SUCCESS_DISTANCE: 3.0
-  NDTW:
-    GT_PATH: data/datasets/R2R_VLNCE_v1-3_preprocessed/{split}/{split}_gt.json.gz
 DATASET:
   TYPE: VLN-CE-v1
   SPLIT: train

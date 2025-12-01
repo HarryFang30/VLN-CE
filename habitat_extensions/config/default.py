@@ -23,6 +23,11 @@ _C.TASK.ORACLE_ACTION_SENSOR = CN()
 _C.TASK.ORACLE_ACTION_SENSOR.TYPE = "OracleActionSensor"
 _C.TASK.ORACLE_ACTION_SENSOR.GOAL_RADIUS = 0.5
 # ----------------------------------------------------------------------------
+# # INSTRUCTION SENSOR (R2R)
+# ----------------------------------------------------------------------------
+_C.TASK.INSTRUCTION_SENSOR = CN()
+_C.TASK.INSTRUCTION_SENSOR.TYPE = "InstructionSensor"
+# ----------------------------------------------------------------------------
 # # RXR INSTRUCTION SENSOR
 # ----------------------------------------------------------------------------
 _C.TASK.RXR_INSTRUCTION_SENSOR = CN()
@@ -162,6 +167,23 @@ def get_extended_config(
 
     if opts:
         config.merge_from_list(opts)
+
+    def _drop_hfov_if_equirect(sensor_cfg):
+        if not hasattr(sensor_cfg, "TYPE"):
+            return
+        sensor_type = getattr(sensor_cfg, "TYPE")
+        if sensor_type in (
+            "HabitatSimEquirectangularRGBSensor",
+            "HabitatSimEquirectangularDepthSensor",
+            "HabitatSimEquirectangularSemanticSensor",
+        ) and "HFOV" in sensor_cfg:
+            sensor_cfg.defrost()
+            sensor_cfg.pop("HFOV")
+
+    if hasattr(config.SIMULATOR, "RGB_SENSOR"):
+        _drop_hfov_if_equirect(config.SIMULATOR.RGB_SENSOR)
+    if hasattr(config.SIMULATOR, "DEPTH_SENSOR"):
+        _drop_hfov_if_equirect(config.SIMULATOR.DEPTH_SENSOR)
 
     # set split-dependent metrics to the current split.
     config.TASK.NDTW.SPLIT = config.DATASET.SPLIT

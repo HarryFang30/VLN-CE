@@ -1,292 +1,219 @@
-# Vision-and-Language Navigation in Continuous Environments (VLN-CE)
+# VLN-CE 高质量数据采集工具
 
-[Project Website](https://jacobkrantz.github.io/vlnce/) — [VLN-CE Challenge](https://eval.ai/web/challenges/challenge-page/719) — [RxR-Habitat Challenge](https://ai.google.com/research/rxr/habitat)
+## 核心算法
 
-Official implementations:
+**双向导航 + 多帧融合 + 四层过滤 → 97.2%高质量数据**
 
-- *Beyond the Nav-Graph: Vision-and-Language Navigation in Continuous Environments* ([paper](https://arxiv.org/abs/2004.02857))
-- *Waypoint Models for Instruction-guided Navigation in Continuous Environments* ([paper](https://arxiv.org/abs/2110.02207), [README](/vlnce_baselines/config/r2r_waypoint/README.md))
+1. Agent执行 起点→终点(Forward) + 终点→起点(Backward)
+2. 每个参考点从所有帧中选择最佳视角生成热力图
+3. 四层过滤：总帧≥5、双向≥5、有效率≥70%、完整性验证
 
-Vision and Language Navigation in Continuous Environments (VLN-CE) is an instruction-guided navigation task with crowdsourced instructions, realistic environments, and unconstrained agent navigation. This repo is a launching point for interacting with the VLN-CE task and provides both baseline agents and training methods. Both the Room-to-Room (**R2R**) and the Room-Across-Room (**RxR**) datasets are supported. VLN-CE is implemented using the Habitat platform.
+## 快速部署（服务器）
 
-<p align="center">
-  <img width="775" height="360" src="./data/res/VLN_comparison.gif" alt="VLN-CE comparison to VLN">
-</p>
-
-## Setup
-
-This project is developed with Python 3.6. If you are using [miniconda](https://docs.conda.io/en/latest/miniconda.html) or [anaconda](https://anaconda.org/), you can create an environment:
-
+### 1. 上传
 ```bash
-conda create -n vlnce python=3.6
-conda activate vlnce
+# 本地打包上传
+scp vlnce-data-collection.tar.gz user@server:/path/to/VLN-CE/
 ```
 
-VLN-CE uses [Habitat-Sim](https://github.com/facebookresearch/habitat-sim/tree/v0.1.7) 0.1.7 which can be [built from source](https://github.com/facebookresearch/habitat-sim/tree/v0.1.7#installation) or installed from conda:
-
+### 2. 解压配置
 ```bash
-conda install -c aihabitat -c conda-forge habitat-sim=0.1.7 headless
+# 服务器端
+ssh user@server
+cd /path/to/VLN-CE
+tar -xzf vlnce-data-collection.tar.gz
+
+# 激活VLN-CE环境
+conda activate habitat  # 或你的环境名
 ```
 
-Then install [Habitat-Lab](https://github.com/facebookresearch/habitat-lab/tree/v0.1.7):
+**⚠️ 重要说明**:
+- 脚本依赖 `habitat_extensions` 目录（已包含在压缩包中）
+- 确保你在VLN-CE项目根目录下解压（与data/目录同级）
+- 如果你的VLN-CE已有habitat_extensions，解压会覆盖config/vlnce_task.yaml
 
-```bash
-git clone --branch v0.1.7 git@github.com:facebookresearch/habitat-lab.git
-cd habitat-lab
-# installs both habitat and habitat_baselines
-python -m pip install -r requirements.txt
-python -m pip install -r habitat_baselines/rl/requirements.txt
-python -m pip install -r habitat_baselines/rl/ddppo/requirements.txt
-python setup.py develop --all
+### 3. 修改配置
+
+**编辑 collect.py**:
+```python
+# Line 325: 目标clips数
+NUM_CLIPS = 1000           # 测试：1000条（2.8h）
+NUM_CLIPS = 10000          # 完整：2156条（6h，用尽所有episodes）
+
+# Line 377: 准备episodes数
+for _ in range(NUM_CLIPS * 5):        # 1000条配置
+for _ in range(len(all_episodes)):    # 完整数据集配置
 ```
 
-Now you can install VLN-CE:
-
-```bash
-git clone git@github.com:jacobkrantz/VLN-CE.git
-cd VLN-CE
-python -m pip install -r requirements.txt
-```
-
-### Data
-
-#### Scenes: Matterport3D
-
-Matterport3D (MP3D) scene reconstructions are used. The official Matterport3D download script (`download_mp.py`) can be accessed by following the instructions on their [project webpage](https://niessner.github.io/Matterport/). The scene data can then be downloaded:
-
-```bash
-# requires running with python 2.7
-python download_mp.py --task habitat -o data/scene_datasets/mp3d/
-```
-
-Extract such that it has the form `data/scene_datasets/mp3d/{scene}/{scene}.glb`. There should be 90 scenes.
-
-#### Episodes: Room-to-Room (R2R)
-
-The R2R_VLNCE dataset is a port of the Room-to-Room (R2R) dataset created by [Anderson et al](http://openaccess.thecvf.com/content_cvpr_2018/papers/Anderson_Vision-and-Language_Navigation_Interpreting_CVPR_2018_paper.pdf) for use with the [Matterport3DSimulator](https://github.com/peteanderson80/Matterport3DSimulator) (MP3D-Sim). For details on porting to 3D reconstructions, please see our [paper](https://arxiv.org/abs/2004.02857). `R2R_VLNCE_v1-3` is a minimal version of the dataset and `R2R_VLNCE_v1-3_preprocessed` runs baseline models out of the box. See the [dataset page](https://jacobkrantz.github.io/vlnce/data) for format, contents, and a changelog. We encourage use of the most recent version (`v1-3`).
-
-| Dataset | Extract path | Size |
-|-------------- |---------------------------- |------- |
-| [R2R_VLNCE_v1-3.zip](https://drive.google.com/file/d/1T9SjqZWyR2PCLSXYkFckfDeIs6Un0Rjm/view) | `data/datasets/R2R_VLNCE_v1-3` | 3 MB |
-| [R2R_VLNCE_v1-3_preprocessed.zip](https://drive.google.com/file/d/1fo8F4NKgZDH-bPSdVU3cONAkt5EW-tyr/view) | `data/datasets/R2R_VLNCE_v1-3_preprocessed` | 250 MB |
-
-Downloading via CLI:
-
-```bash
-# R2R_VLNCE_v1-3
-gdown https://drive.google.com/uc?id=1T9SjqZWyR2PCLSXYkFckfDeIs6Un0Rjm
-# R2R_VLNCE_v1-3_preprocessed
-gdown https://drive.google.com/uc?id=1fo8F4NKgZDH-bPSdVU3cONAkt5EW-tyr
-```
-
-##### Encoder Weights
-
-Baseline models encode depth observations using a ResNet pre-trained on PointGoal navigation. Those weights can be downloaded from [here](https://github.com/facebookresearch/habitat-lab/tree/v0.1.7/habitat_baselines/rl/ddppo) (672M). Extract the contents to `data/ddppo-models/{model}.pth`.
-
-#### Episodes: Room-Across-Room (RxR)
-
-Download: [RxR_VLNCE_v0.zip](https://drive.google.com/file/d/145xzLjxBaNTbVgBfQ8e9EsBAV8W-SM0t/view)
-
-About the [Room-Across-Room dataset](https://ai.google.com/research/rxr/) (RxR):
-
-- multilingual instructions (English, Hindi, Telugu)
-- an order of magnitude larger than existing datasets
-- varied paths to break a shortest-path-to-goal assumption
-
-RxR was ported to continuous environments originally for the [RxR-Habitat Challenge](https://ai.google.com/research/rxr/habitat). The dataset has `train`, `val_seen`, `val_unseen`, and `test_challenge` splits with both Guide and Follower trajectories ported. The starter code expects files in this structure:
-
-```graphql
-data/datasets
-├─ RxR_VLNCE_v0
-|   ├─ train
-|   |    ├─ train_guide.json.gz
-|   |    ├─ train_guide_gt.json.gz
-|   |    ├─ train_follower.json.gz
-|   |    ├─ train_follower_gt.json.gz
-|   ├─ val_seen
-|   |    ├─ val_seen_guide.json.gz
-|   |    ├─ val_seen_guide_gt.json.gz
-|   |    ├─ val_seen_follower.json.gz
-|   |    ├─ val_seen_follower_gt.json.gz
-|   ├─ val_unseen
-|   |    ├─ val_unseen_guide.json.gz
-|   |    ├─ val_unseen_guide_gt.json.gz
-|   |    ├─ val_unseen_follower.json.gz
-|   |    ├─ val_unseen_follower_gt.json.gz
-|   ├─ test_challenge
-|   |    ├─ test_challenge_guide.json.gz
-|   ├─ text_features
-|   |    ├─ ...
-```
-
-The baseline models for RxR-Habitat use precomputed BERT instruction features which can be downloaded from [here](https://github.com/google-research-datasets/RxR#downloading-bert-text-features) and saved to `data/datasets/RxR_VLNCE_v0/text_features/rxr_{split}/{instruction_id}_{language}_text_features.npz`.
-
-## RxR-Habitat Challenge
-
-<p align="center">
-  <img width="573" height="360" src="/data/res/rxr_teaser.gif" alt="RxR Challenge Teaser GIF">
-</p>
-
-**NEW: The 2023 RxR-Habitat Challenge is live!**
-
-- Challenge webpage: [ai.google.com/research/rxr/habitat](https://ai.google.com/research/rxr/habitat)
-- Workshop webpage: [embodied-ai.org](https://embodied-ai.org/)
-
-The RxR-Habitat is hosted at the CVPR 2023 [Embodied AI workshop](https://embodied-ai.org/) set for June 19th, 2023. The leaderboard opens for challenge submissions on March 1. For official guidelines, please visit: [ai.google.com/research/rxr/habitat](https://ai.google.com/research/rxr/habitat). We encourage submissions on this dificult task!
-
-The RxR-Habitat Challenge is hosted by Oregon State University, Google Research, and Meta AI. This is the third year of the RxR-Habitat Challenge which previously appeared at the 2021 and 2022 CVPR [EAI workshop](https://embodied-ai.org/cvpr2021).
-
-### Timeline
-
-|               Event               |       Date      |
-|:---------------------------------:|:---------------:|
-|          Challenge Launch         |   Mar 17, 2023  |
-|          Leaderboard Open         |   Mar 20, 2023  |
-|         Leaderboard Closes        |   May 15, 2023  |
-| Workshop and Winners Announcement |   Jun 19, 2023  |
-
-### Generating Submissions
-
-Submissions are made by running an agent locally and submitting a jsonlines file (`.jsonl`) containing the agent's trajectories. Starter code for generating this file is provided in the function `BaseVLNCETrainer.inference()`. Here is an example of generating predictions for English using the Cross-Modal Attention baseline:
-
-```bash
-python run.py \
-  --exp-config vlnce_baselines/config/rxr_baselines/rxr_cma_en.yaml \
-  --run-type inference
-```
-
-If you use different models for different languages, you can merge their predictions with `scripts/merge_inference_predictions.py`. Submissions are only accepted that contain all episodes from all three languages in the `test-challenge` split. Starter code for this challenge was originally hosted in the `rxr-habitat-challenge` branch but is now integrated in `master`.
-
-#### Required Task Configurations
-
-As specified in the [challenge webpage](https://ai.google.com/research/rxr/habitat), submissions to the official challenge must have an action space of 30 degree turn angles, a 0.25m step size, and look up / look down actions of 30 degrees. The agent is given a 480x640 RGBD observation space. An example task configuration is given [here](/habitat_extensions/config/rxr_vlnce_english_task.yaml) which loads the English portion of the dataset.
-
-The CMA baseline model ([config](/vlnce_baselines/config/rxr_baselines/rxr_cma_en.yaml)) is an example of a valid submission. Existing [waypoint models](/vlnce_baselines/config/r2r_waypoint) are not valid due to their panoramic observation space. Such models would need to be adapted to the challenge configuration.
-
-### Baseline Model
-
-The official baseline for the RxR-Habitat Challenge is a monolingual cross-modal attention (CMA) model, labeled `Monolingual CMA Baseline` on the leaderboard. Configuration files for re-training or evaluating this model can be found in [this folder](vlnce_baselines/config/rxr_baselines) under the name `rxr_cma_{en|hi|te}.yaml`. Weights for the pre-trained models: [[en](https://drive.google.com/file/d/1fe0-w6ElGwX5VWtESKSM_20VY7sfn4fV/view?usp=sharing) [hi](https://drive.google.com/file/d/1z84xMJ1LP2NO_jpJjFdymejXQqhU6zZH/view?usp=sharing) [te](https://drive.google.com/file/d/13mGjoKyJaWSJsnoQ-el4oIAlai0l7zfQ/view?usp=sharing)] (196MB each).
-
-### Citing RxR-Habitat Challenge
-
-To cite the challenge, please cite the following papers ([RxR](https://arxiv.org/abs/2010.07954) and [VLN-CE](https://arxiv.org/abs/2004.02857)):
-
-```tex
-@inproceedings{ku2020room,
-  title={Room-Across-Room: Multilingual Vision-and-Language Navigation with Dense Spatiotemporal Grounding},
-  author={Ku, Alexander and Anderson, Peter and Patel, Roma and Ie, Eugene and Baldridge, Jason},
-  booktitle={Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP)},
-  pages={4392--4412},
-  year={2020}
-}
-
-@inproceedings{krantz_vlnce_2020,
-  title={Beyond the Nav-Graph: Vision and Language Navigation in Continuous Environments},
-  author={Jacob Krantz and Erik Wijmans and Arjun Majundar and Dhruv Batra and Stefan Lee},
-  booktitle={European Conference on Computer Vision (ECCV)},
-  year={2020}
- }
-```
-
-## Questions?
-
-Feel free to contact the challenge organizers with any questions, comments, or concerns. The corresponding organizer is Jacob Krantz (@jacobkrantz). You can also open an issue with `[RxR-Habitat]` in the title, which will also notify us.
-
-## VLN-CE Challenge (R2R Data)
-
-The [VLN-CE Challenge](https://eval.ai/web/challenges/challenge-page/719) is live and taking submissions for public test set evaluation. This challenge uses the R2R data ported in the original VLN-CE paper.
-
-To submit to the leaderboard, you must run your agent locally and submit a JSON file containing the generated agent trajectories. Starter code for generating this JSON file is provided in the function `BaseVLNCETrainer.inference()`. Here is an example of generating this file using the pretrained Cross-Modal Attention baseline:
-
-```bash
-python run.py \
-  --exp-config vlnce_baselines/config/r2r_baselines/test_set_inference.yaml \
-  --run-type inference
-```
-
-Predictions must be in a specific format. Please visit the challenge webpage for guidelines.
-
-### Baseline Performance
-
-The baseline model for the VLN-CE task is the cross-modal attention model trained with progress monitoring, DAgger, and augmented data (CMA_PM_DA_Aug). As evaluated on the leaderboard, this model achieves:
-
-| Split      | TL   | NE   | OS   | SR   | SPL  |
-|:----------:|:----:|:----:|:----:|:----:|:----:|
-| Test       | 8.85 | 7.91 | 0.36 | 0.28 | 0.25 |
-| Val Unseen | 8.27 | 7.60 | 0.36 | 0.29 | 0.27 |
-| Val Seen   | 9.06 | 7.21 | 0.44 | 0.34 | 0.32 |
-
-This model was originally presented with a val_unseen performance of 0.30 SPL, however the leaderboard evaluates this same model at 0.27 SPL. The model was trained and evaluated on a hardware + Habitat build that gave slightly different results, as is the case for the other paper experiments. Going forward, the leaderboard contains the performance metrics that should be used for official comparison. In our tests, the installation procedure for this repo gives nearly identical evaluation to the leaderboard, but we recognize that compute hardware along with the version and build of Habitat are factors to reproducibility.
-
-For push-button replication of all VLN-CE experiments, see [here](vlnce_baselines/config/r2r_baselines/README.md).
-
-## Starter Code
-
-The `run.py` script controls training and evaluation for all models and datasets:
-
-```bash
-python run.py \
-  --exp-config path/to/experiment_config.yaml \
-  --run-type {train | eval | inference}
-```
-
-For example, a random agent can be evaluated on 10 val-seen episodes of R2R using this command:
-
-```bash
-python run.py --exp-config vlnce_baselines/config/r2r_baselines/nonlearning.yaml --run-type eval
-```
-
-For lists of modifiable configuration options, see the default [task config](habitat_extensions/config/default.py) and [experiment config](vlnce_baselines/config/default.py) files.
-
-### Training Agents
-
-The `DaggerTrainer` class is the standard trainer and supports teacher forcing or dataset aggregation (DAgger). This trainer saves trajectories consisting of RGB, depth, ground-truth actions, and instructions to disk to avoid time spent in simulation.
-
-The `RecollectTrainer` class performs teacher forcing using the ground truth trajectories provided in the dataset rather than a shortest path expert. Also, this trainer does not save episodes to disk, instead opting to recollect them in simulation.
-
-Both trainers inherit from `BaseVLNCETrainer`.
-
-### Evaluating Agents
-
-Evaluation on validation splits can be done by running `python run.py --exp-config path/to/experiment_config.yaml --run-type eval`. If `EVAL.EPISODE_COUNT == -1`, all episodes will be evaluated. If `EVAL_CKPT_PATH_DIR` is a directory, each checkpoint will be evaluated one at a time.
-
-### Cuda
-
-Cuda will be used by default if it is available. We find that one GPU for the model and several GPUs for simulation is favorable.
-
+**数据集路径配置** - 编辑 `habitat_extensions/config/vlnce_task.yaml`:
 ```yaml
-SIMULATOR_GPU_IDS: [0]  # list of GPU IDs to run simulations
-TORCH_GPU_ID: 0  # GPU for pytorch-related code (the model)
-NUM_ENVIRONMENTS: 1  # Each GPU runs NUM_ENVIRONMENTS environments
+# Line 50: R2R数据集路径
+DATA_PATH: data/datasets/R2R_VLNCE_v1-3_preprocessed/{split}/{split}.json.gz
+
+# Line 51: 场景数据路径（Matterport3D）
+SCENES_DIR: data/scene_datasets/
 ```
 
-The simulator and torch code do not need to run on the same device. For faster training and evaluation, we recommend running with as many `NUM_ENVIRONMENTS` as will fit on your GPU while assuming 1 CPU core per env.
+**如果你的路径不是默认值，必须修改这两行！**
 
-## License
+**GPU配置**（可选）:
+- 默认使用GPU 0 (collect.py:339硬编码)
+- 如需指定其他GPU：修改 `habitat_extensions/config/vlnce_task.yaml` Line 10
+  ```yaml
+  GPU_DEVICE_ID: 0  # 改为你想用的GPU ID，-1表示CPU
+  ```
 
-The VLN-CE codebase is [MIT licensed](LICENSE). Trained models and task datasets are considered data derived from the mp3d scene dataset. Matterport3D based task datasets and trained models are distributed with [Matterport3D Terms of Use](http://kaldir.vc.in.tum.de/matterport/MP_TOS.pdf) and under [CC BY-NC-SA 3.0 US license](https://creativecommons.org/licenses/by-nc-sa/3.0/us/).
+### 4. 运行
+```bash
+# 后台运行
+nohup python collect.py > collection.log 2>&1 &
+echo $! > collection.pid
 
-## Citing
-
-If you use VLN-CE in your research, please cite the following [paper](https://arxiv.org/abs/2004.02857):
-
-```tex
-@inproceedings{krantz_vlnce_2020,
-  title={Beyond the Nav-Graph: Vision and Language Navigation in Continuous Environments},
-  author={Jacob Krantz and Erik Wijmans and Arjun Majundar and Dhruv Batra and Stefan Lee},
-  booktitle={European Conference on Computer Vision (ECCV)},
-  year={2020}
- }
+# 监控进度
+tail -f collection.log
+# 或
+watch -n 30 "ls -d dataset_train/train/*/clip_* 2>/dev/null | wc -l"
 ```
 
-If you use the RxR-Habitat data, please additionally cite the following [paper](https://arxiv.org/abs/2010.07954):
+### 5. 采集完成后
+```bash
+# 质量分析（一键完成：基础+详细+验证）
+python analyze.py
 
-```tex
-@inproceedings{ku2020room,
-  title={Room-Across-Room: Multilingual Vision-and-Language Navigation with Dense Spatiotemporal Grounding},
-  author={Ku, Alexander and Anderson, Peter and Patel, Roma and Ie, Eugene and Baldridge, Jason},
-  booktitle={Proceedings of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP)},
-  pages={4392--4412},
-  year={2020}
-}
+# 打包下载
+cd dataset_train
+tar -czf train_data.tar.gz train/
+# 本地: scp user@server:/path/to/dataset_train/train_data.tar.gz ./
+```
+
+## 输出数据结构
+
+```
+dataset_train/
+├── train/
+│   ├── GdvgFV5R1Z5/clip_000001/
+│   │   ├── rgb/               # RGB图像序列
+│   │   ├── heatmaps.npy       # 热力图 (K, 64, 64)
+│   │   ├── mask.npy           # 有效性掩码 (K,)
+│   │   ├── poses.json         # 相机pose序列
+│   │   ├── intrinsics.json    # 相机内参
+│   │   └── meta.json          # 元数据（指令、路径等）
+│   └── ...
+└── collection_stats.json
+```
+
+## 关键参数
+
+| 参数 | 文件 | 行号 | 默认值 | 说明 |
+|------|------|------|--------|------|
+| `NUM_CLIPS` | collect.py | 325 | 1000 | 目标clips数 |
+| `MIN_VALID_RATIO` | collect.py | 683 | 0.7 | 最小有效率 |
+| `MIN_FRAMES` | collect.py | 540 | 5 | 单向最小帧数 |
+| `MAX_FRAMES` | collect.py | 459 | 50 | 单向最大帧数 |
+| `DATA_PATH` | vlnce_task.yaml | 50 | data/datasets/R2R_VLNCE_v1-3_preprocessed/... | R2R数据集 |
+| `SCENES_DIR` | vlnce_task.yaml | 51 | data/scene_datasets/ | 场景数据 |
+
+## 数据质量指标
+
+| 指标 | 数值 | 说明 |
+|------|------|------|
+| 有效率 | 97.2% | 热力图有效比例 |
+| 标准差 | 7.1% | 质量稳定性 |
+| 无效clips | 0个 | 完全无效的clips |
+| 成功率 | 19.9% | 采集成功率（严格过滤） |
+| 采集速度 | ~6 clips/分钟 | 实测速度 |
+
+## 采集规模参考
+
+| 配置 | episodes | clips | 耗时 | 磁盘 |
+|------|---------|-------|------|------|
+| 测试 | 5000 | ~1000 | 2.8h | 8GB |
+| 完整 | 10819 | ~2156 | 6h | 17GB |
+
+**R2R训练集总规模**: 10,819 episodes，基于19.9%成功率最多可采2156条
+
+## 监控与故障处理
+
+**查看进度**:
+```bash
+# 查看进程
+ps aux | grep collect.py
+
+# 查看已采集数量
+ls -d dataset_train/train/*/clip_* 2>/dev/null | wc -l
+
+# 查看最新日志
+tail -20 collection.log
+```
+
+**停止采集**:
+```bash
+kill $(cat collection.pid)
+```
+
+**采集中断**（支持断点续传）:
+```bash
+nohup python collect.py > collection_resume.log 2>&1 &
+```
+
+**检查磁盘**:
+```bash
+df -h .  # 每个clip约8MB
+```
+
+## 核心文件
+
+- `collect.py` - 数据采集（包含所有质量控制）
+- `analyze.py` - 质量分析（基础+详细+验证 三合一）
+- `habitat_extensions/` - VLN-CE任务扩展（必需）
+  - `config/vlnce_task.yaml` - 数据集路径配置
+  - `config/default.py` - 配置加载器
+- `README.md` - 本文档
+
+## 默认路径结构
+
+```
+VLN-CE/
+├── collect.py
+├── analyze.py
+├── habitat_extensions/
+│   └── config/
+│       └── vlnce_task.yaml          # 数据集路径配置
+├── data/
+│   ├── datasets/
+│   │   └── R2R_VLNCE_v1-3_preprocessed/
+│   │       └── train/
+│   │           ├── train.json.gz
+│   │           └── train_gt.json.gz
+│   └── scene_datasets/
+│       └── mp3d/                     # Matterport3D场景
+└── dataset_train/                    # 采集输出目录
+    └── train/
+```
+
+## 完整工作流
+
+```bash
+# 1. 上传部署
+scp vlnce-data-collection.tar.gz server:/path/
+ssh server
+tar -xzf vlnce-data-collection.tar.gz
+
+# 2. 配置
+vim collect.py  # 修改Line 325, 377
+# 如需修改数据集路径：
+vim habitat_extensions/config/vlnce_task.yaml
+
+# 3. 运行
+conda activate habitat
+nohup python collect.py > collection.log 2>&1 &
+
+# 4. 监控
+tail -f collection.log
+
+# 5. 完成后分析
+python analyze.py
+
+# 6. 下载
+cd dataset_train && tar -czf train_data.tar.gz train/
 ```

@@ -141,54 +141,62 @@ def get_sensor_extrinsics(config) -> np.ndarray:
 
 def compute_intrinsics(config) -> Dict:
     """
-    从配置计算相机内参（确保 RGB/Depth 一致）
-
-    重要：Habitat-Sim使用方形像素，但仅指定HFOV。
-    对于非方形分辨率，VFOV由HFOV和宽高比通过反三角关系计算：
-    VFOV = 2 × arctan((H/W) × tan(HFOV/2))
-
-    注意：VFOV ≠ HFOV × (H/W)，后者仅在小角度时近似成立。
-
-    参考：https://github.com/facebookresearch/habitat-lab/issues/474
+    计算Equirectangular传感器的基础参数（水平360°、垂直180°）
     """
     rgb_cfg = config.SIMULATOR.RGB_SENSOR
+    width = int(rgb_cfg.WIDTH)
+    height = int(rgb_cfg.HEIGHT)
+    subtype = getattr(rgb_cfg, "SENSOR_SUBTYPE", "PINHOLE")
+    subtype_str = str(subtype).upper()
+    if "EQUIRECT" not in subtype_str:
+        raise ValueError(
+            "collect.py 现在要求 RGB_SENSOR.SENSOR_SUBTYPE 为 EQUIRECTANGULAR，"
+            f" 当前值为 {subtype}"
+        )
 
-    width = rgb_cfg.WIDTH
-    height = rgb_cfg.HEIGHT
-    hfov_degrees = rgb_cfg.HFOV
-
-    # 计算焦距
-    # fx: 使用水平FOV
-    hfov_rad = math.radians(hfov_degrees)
-    fx = width / (2.0 * math.tan(hfov_rad / 2.0))
-
-    # fy: 使用推导的垂直FOV（反三角关系，非线性比例）
-    # Habitat使用方形像素，VFOV = 2*atan((H/W)*tan(HFOV/2))
-    vfov_rad = 2.0 * math.atan((height / width) * math.tan(hfov_rad / 2.0))
-    fy = height / (2.0 * math.tan(vfov_rad / 2.0))
-    vfov_degrees = math.degrees(vfov_rad)
-
-    # 主点（光心）通常在图像中心
-    cx = width / 2.0
-    cy = height / 2.0
-
-    K = np.array([
-        [fx, 0.0, cx],
-        [0.0, fy, cy],
-        [0.0, 0.0, 1.0]
-    ], dtype=np.float32)
+    horizontal_fov = float(getattr(rgb_cfg, "HFOV", 360.0))
+    vertical_fov = 180.0  # 全景默认覆盖 -90°~90°
+    pixels_per_rad_h = width / (2.0 * math.pi)
+    pixels_per_rad_v = height / math.pi
 
     return {
-        "fx": float(fx),
-        "fy": float(fy),
-        "cx": float(cx),
-        "cy": float(cy),
-        "K": K.tolist(),
+        "projection": "equirectangular",
         "width": width,
         "height": height,
-        "hfov": hfov_degrees,
-        "vfov": vfov_degrees  # 记录推导的VFOV
+        "hfov": horizontal_fov,
+        "vfov": vertical_fov,
+        "pixels_per_radian_horizontal": pixels_per_rad_h,
+        "pixels_per_radian_vertical": pixels_per_rad_v
     }
+
+
+def project_point_equirect(p_cam: np.ndarray, width: int, height: int) -> Tuple[float, float]:
+    """
+    将相机坐标系下的3D点投影到Equirectangular图像坐标
+
+    Args:
+        p_cam: [x, y, z, w] 或长度>=3的向量
+        width: 图像宽度
+        height: 图像高度
+
+    Returns:
+        (u, v): 像素坐标（可能是浮点数）
+    """
+    x, y, z = float(p_cam[0]), float(p_cam[1]), float(p_cam[2])
+    r = math.sqrt(x * x + y * y + z * z)
+    if r < 1e-6:
+        return None
+
+    phi = math.atan2(x, -z)  # 水平角，前方=0
+    theta = math.asin(np.clip(y / r, -1.0, 1.0))  # 垂直角，向上为正
+
+    u = (phi + math.pi) / (2.0 * math.pi) * width
+    v = (0.5 - (theta / math.pi)) * height
+
+    # wrap 水平方向，确保u∈[0, width)
+    u = u % width
+    v = np.clip(v, 0.0, height - 1e-6)
+    return float(u), float(v)
 
 
 def compute_camera_pose(agent_state, T_agent_cam: np.ndarray) -> np.ndarray:
@@ -380,8 +388,7 @@ def draw_nerf_ripple_point(
     np.add(roi, blob, out=roi)
 
 def compute_adaptive_min_valid_ratio(
-    forward_keyframe_distances: List[float],
-    backward_keyframe_distances: List[float]
+    keyframe_distances: List[float]
 ) -> Tuple[float, str]:
     """
     基于轨迹质量动态计算MIN_VALID_RATIO阈值（线性插值）
@@ -396,8 +403,7 @@ def compute_adaptive_min_valid_ratio(
     - 中间质量：线性插值
 
     Args:
-        forward_keyframe_distances: 正向轨迹关键帧距离列表（米）
-        backward_keyframe_distances: 反向轨迹关键帧距离列表（米）
+        keyframe_distances: 轨迹关键帧距离列表（米）
 
     Returns:
         (threshold, quality_tier): 自适应阈值[0.40, 0.70]和质量等级标签
@@ -409,9 +415,10 @@ def compute_adaptive_min_valid_ratio(
         - acceptable: 1.5m < avg_dist ≤ 2.5m → threshold = 0.50-0.40
         - low:       avg_dist > 2.5m → threshold = 0.40
     """
-    forward_mean = np.mean(forward_keyframe_distances)
-    backward_mean = np.mean(backward_keyframe_distances)
-    avg_dist = (forward_mean + backward_mean) / 2.0
+    if len(keyframe_distances) == 0:
+        return 0.4, "low"
+
+    avg_dist = float(np.mean(keyframe_distances))
 
     # 线性插值：[0.3m → 0.70, 2.5m → 0.40]
     if avg_dist <= 0.3:
@@ -439,230 +446,31 @@ def compute_adaptive_min_valid_ratio(
 
 def compute_adaptive_sigma(
     distance: float,
-    fx: float,
     object_size_3d: float = 0.3,
     heatmap_width: int = 64,
-    img_width: int = 640,
     min_sigma: float = 0.5,
     max_sigma: float = 5.0
 ) -> float:
     """
-    计算基于投影尺度的自适应sigma
-
-    原理：Sigma应该代表固定3D不确定区域的投影大小。
-    一个object_size_3d米的物体在不同距离下投影到不同的像素数量。
+    计算Equirectangular坐标系下的自适应sigma（按角度缩放）
 
     Args:
-        distance: 光轴深度/Z深度（米，非欧氏距离）
-                 因为成像比例尺 ~ fx/Z，使用Z深度更准确
-        fx: 焦距（原始图像分辨率下的像素单位）
-        object_size_3d: 3D不确定半径（米），默认0.3m
-        heatmap_width: 热力图分辨率宽度
-        img_width: 原始图像宽度
-        min_sigma: 最小sigma（热力图像素单位）
-        max_sigma: 最大sigma（热力图像素单位）
-
-    Returns:
-        sigma: 自适应sigma（热力图像素单位）
-
-    示例（基于Z深度）：
-        - 2m距离: sigma ≈ 1.6 像素
-        - 5m距离: sigma ≈ 0.64 像素
-        - 15m距离: sigma ≈ 0.5 像素（被min_sigma限制）
+        distance: 欧氏距离（米）
+        object_size_3d: 3D空间中的目标尺寸（米）
+        heatmap_width: 热力图分辨率宽度（用于水平角分辨率）
+        min_sigma / max_sigma: sigma的约束范围
     """
-    # 计算3D物体在原始图像分辨率下的投影半径（像素）
-    projected_radius_pixels = (fx * object_size_3d) / distance
+    if distance <= 1e-4:
+        return float(max_sigma)
 
-    # 缩放到热力图分辨率
-    projected_radius_heatmap = projected_radius_pixels * (heatmap_width / img_width)
-
-    # 使用3-sigma规则：半径约等于3σ（99.7%覆盖）
+    # 角半径（弧度）
+    angular_radius = math.atan2(object_size_3d, distance)
+    pixels_per_rad = heatmap_width / (2.0 * math.pi)
+    projected_radius_heatmap = angular_radius * pixels_per_rad
     sigma = projected_radius_heatmap / 3.0
-
-    # 限制在合理范围内，防止极端值
     sigma = np.clip(sigma, min_sigma, max_sigma)
+    return float(sigma)
 
-    return sigma
-
-
-def find_best_frame_for_point(
-    ref_point: List[float],
-    poses: List[List],
-    K_mat: np.ndarray,
-    img_width: int,
-    img_height: int,
-    heatmap_width: int,
-    heatmap_height: int,
-    sigma: float,
-    depth_images: List[np.ndarray] = None,
-    occlusion_threshold: float = 0.15,
-    preferred_distance_range: Tuple[float, float] = (0.5, 20.0),
-    z_forward_negative: bool = True,
-    depth_normalize: bool = False,
-    depth_min: float = 0.0,
-    depth_max: float = 10.0,
-    poses_inv: List[np.ndarray] = None
-) -> Tuple[int, float, float, bool, float]:
-    """
-    为3D参考点找到最佳观察帧（改进版）
-
-    注意：Habitat使用OpenGL相机坐标系约定（-Z朝前，+Y向上，+X向右）
-
-    策略:
-    1. 点必须在相机前方 (z < 0, 因为Habitat使用-Z朝前)
-    2. 点可以在图像边缘外一定距离（±margin）
-    3. 遮挡检测：使用深度图检查点是否被遮挡（可选）
-    4. 多准则评分：距离、视角、像面位置
-    5. 如果有多个候选帧，选择综合评分最高的
-
-    Args:
-        ref_point: [x, y, z] 3D参考点
-        poses: 所有帧的位姿列表 (List of 4×4 matrices)
-        K_mat: 相机内参矩阵
-        img_width: 图像宽度
-        img_height: 图像高度
-        heatmap_width: 热力图宽度（用于计算margin_x）
-        heatmap_height: 热力图高度（用于计算margin_y）
-        sigma: 高斯标准差（像素单位，热力图分辨率）
-        depth_images: 深度图列表（用于遮挡检测，可选）
-        occlusion_threshold: 遮挡判定阈值（米），默认0.15m
-        preferred_distance_range: (min_dist, max_dist) 优先距离范围
-
-    Returns:
-        (best_frame_idx, u, v, is_valid, distance)
-        - best_frame_idx: 最佳帧索引 (-1 if 没有找到)
-        - u, v: 投影坐标
-        - is_valid: 是否有效
-        - distance: 光轴深度/Z深度（米，非欧氏距离），用于自适应sigma和距离评分
-                   因为成像比例尺 ~ fx/Z，使用Z深度更准确
-    """
-    p_world = np.array([ref_point[0], ref_point[1], ref_point[2], 1.0], dtype=np.float32)
-
-    # 计算允许的边界裕度（基于高斯分布的3σ范围）
-    # sigma是热力图分辨率下的标准差，需要换算到原始图像分辨率
-    # 使用各向异性缩放，避免宽高比不同时的误过滤
-    margin_x = 3 * sigma * (img_width / heatmap_width)
-    margin_y = 3 * sigma * (img_height / heatmap_height)
-
-    candidates = []  # (frame_idx, distance, u, v, viewing_angle, center_distance)
-    debug_stats = {"total": len(poses), "behind": 0, "oob": 0, "occluded": 0, "valid": 0}
-
-    for frame_idx, pose in enumerate(poses):
-        # 转换到相机坐标系 (需要使用world→camera的逆变换)
-        # 使用预计算的逆矩阵（性能优化）
-        if poses_inv is not None:
-            T_c_w = poses_inv[frame_idx]
-        else:
-            T_w_c = np.array(pose, dtype=np.float32)
-            T_c_w = np.linalg.inv(T_w_c)
-        p_cam = T_c_w @ p_world
-
-        # 检查是否在相机前方（自适应Z方向）
-        # z_forward_negative=True: 前方为Z<0 (OpenGL约定)
-        # z_forward_negative=False: 前方为Z>0 (计算机视觉约定)
-        is_front = (p_cam[2] < 0) if z_forward_negative else (p_cam[2] > 0)
-        if not is_front:
-            debug_stats["behind"] += 1
-            continue
-
-        # 投影到图像平面
-        # 使用原始矩阵乘法方式
-        p_img = K_mat @ p_cam[:3]
-        # 检查深度是否过小以避免除零
-        if abs(p_img[2]) < 0.01:  # 如果深度<1cm，跳过
-            debug_stats["behind"] += 1  # 算作behind
-            continue
-        u = p_img[0] / p_img[2]
-        v = p_img[1] / p_img[2]
-
-        # 放宽边界检查：允许点在图像边缘外±margin像素（各向异性）
-        if not (-margin_x <= u < img_width + margin_x and -margin_y <= v < img_height + margin_y):
-            debug_stats["oob"] += 1
-            if debug_stats["oob"] == 1:  # print first OOB case
-                print(f"      [TEMP DEBUG] First OOB: u={u:.1f}, v={v:.1f}, bounds=[{-margin_x:.1f}, {img_width+margin_x:.1f}] x [{-margin_y:.1f}, {img_height+margin_y:.1f}]")
-                print(f"      [TEMP DEBUG] p_cam={p_cam[:3]}, p_img[2]={p_img[2]:.2f}, fx={K_mat[0,0]:.1f}, fy={K_mat[1,1]:.1f}, cx={K_mat[0,2]:.1f}, cy={K_mat[1,2]:.1f}")
-            continue
-
-        # 遮挡检测（如果提供了深度图）
-        passed_oob_check = True  # reached here, so passed behind and OOB checks
-        if depth_images is not None and frame_idx < len(depth_images):
-            # 计算期望深度（相机平面距离，即Z分量的绝对值）
-            # Habitat的depth默认表示光轴方向距离，不是欧氏范数
-            expected_depth = (-p_cam[2]) if z_forward_negative else (p_cam[2])
-            expected_depth = float(abs(expected_depth))
-
-            # 获取深度图中的观测深度
-            depth_img = depth_images[frame_idx]
-
-            # 处理RGB与Depth分辨率不一致的情况（需要缩放坐标）
-            dh, dw = depth_img.shape[0], depth_img.shape[1]
-            if (dw != img_width) or (dh != img_height):
-                u_d = u * (dw / img_width)
-                v_d = v * (dh / img_height)
-            else:
-                u_d, v_d = u, v
-
-            v_int = int(np.clip(v_d, 0, dh - 1))
-            u_int = int(np.clip(u_d, 0, dw - 1))
-
-            # 处理不同的深度图格式（可能是(H,W)或(H,W,1)）
-            if depth_img.ndim == 3 and depth_img.shape[-1] == 1:
-                observed_depth = float(depth_img[v_int, u_int, 0])
-            else:
-                observed_depth = float(depth_img[v_int, u_int])
-
-            # 反归一化深度值（如果配置了NORMALIZE_DEPTH）
-            if depth_normalize:
-                observed_depth = depth_min + observed_depth * (depth_max - depth_min)
-
-            # Debug: print first frame that reaches occlusion check
-            if debug_stats["occluded"] == 0 and debug_stats["valid"] == 0:
-                print(f"      [TEMP DEBUG] First frame reaching occlusion check: expected={expected_depth:.2f}m, observed={observed_depth:.2f}m, valid={np.isfinite(observed_depth) and observed_depth > 0}")
-
-            # 处理无效深度（0/NaN/inf）：直接视为遮挡以避免误用不可见点
-            if not np.isfinite(observed_depth) or observed_depth <= 0:
-                debug_stats["occluded"] += 1
-                continue
-
-            # 如果观测深度明显小于期望深度，说明被遮挡
-            if observed_depth < expected_depth - occlusion_threshold:
-                debug_stats["occluded"] += 1
-                continue  # 跳过被遮挡的点
-
-        # 计算评分所需的几何指标
-        # 使用光轴深度（Z分量），因为成像比例尺 ~ fx/Z
-        z_depth = (-p_cam[2]) if z_forward_negative else (p_cam[2])
-        z_depth = float(abs(z_depth))
-        distance = z_depth  # 用于自适应sigma计算和距离评分
-
-        # 视轴夹角：相机光轴与点方向的夹角（根据Z方向自适配）
-        camera_forward = np.array([0.0, 0.0, -1.0], dtype=np.float32) if z_forward_negative \
-                         else np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        point_direction = p_cam[:3] / np.linalg.norm(p_cam[:3])
-        cos_angle = np.clip(np.dot(camera_forward, point_direction), -1.0, 1.0)
-        viewing_angle = np.arccos(cos_angle)  # 弧度，[0, π]
-
-        # 像面位置：距离图像中心的归一化距离
-        center_u = img_width / 2.0
-        center_v = img_height / 2.0
-        pixel_distance = np.sqrt((u - center_u)**2 + (v - center_v)**2)
-        max_distance = np.sqrt(center_u**2 + center_v**2)  # 对角线距离
-        center_distance = pixel_distance / max_distance  # [0, 1]
-
-        # 通过所有检查，添加到候选列表
-        debug_stats["valid"] += 1
-        if debug_stats["valid"] == 1:  # print first valid case
-            print(f"      [TEMP DEBUG] First VALID frame: frame_idx={frame_idx}, u={u:.1f}, v={v:.1f}, dist={distance:.2f}m")
-        candidates.append((frame_idx, distance, u, v, viewing_angle, center_distance))
-
-    # Temp debug: print first heatmap stats
-    if len(candidates) == 0:
-        valid_count = debug_stats["total"] - debug_stats["behind"] - debug_stats["oob"] - debug_stats["occluded"]
-        print(f"      [TEMP DEBUG] Rejection stats: total={debug_stats['total']}, behind={debug_stats['behind']}, oob={debug_stats['oob']}, occluded={debug_stats['occluded']}, valid={valid_count}")
-
-    if not candidates:
-        # 没有找到有效帧
-        return -1, 0.0, 0.0, False, 0.0  # 返回distance=0.0（无效）
 
     # 多准则评分函数
     def score_candidate(candidate):
@@ -715,9 +523,9 @@ def find_best_frame_for_point(
 CONFIG_PATH = "habitat_extensions/config/vlnce_collect.yaml"
 OUTPUT_ROOT = "/root/autodl-tmp/dataset_train"  # 输出目录
 SPLIT = "train"  # 数据集split
-NUM_CLIPS = 5  # 总共采集的clips数量
-MAX_STEPS = 50
-NUM_WORKERS = 4  # 线程池大小（用于异步I/O）
+NUM_CLIPS = 1000  # 总共采集的clips数量
+MAX_STEPS = 100
+NUM_WORKERS = 16  # 线程池大小（用于异步I/O）
 
 print(f"🚀 Starting data collection (Optimized Version with Keyframe Selection)")
 print(f"   Output: {OUTPUT_ROOT}")
@@ -867,7 +675,7 @@ while clip_id <= NUM_CLIPS:
         # ==================== 失败标志变量 ====================
         clip_failed = False  # 失败标志，用于提前跳出
         failure_reason = ""  # 失败原因描述
-        failure_stage = ""   # 失败阶段标识（io_check/forward_init/forward_trajectory/backward_trajectory/heatmap）
+        failure_stage = ""   # 失败阶段标识（io_check/init/trajectory/heatmap）
 
         # 帧写入失败容忍（最多5%）
         failed_frame_count = 0  # 累计失败帧数
@@ -1038,9 +846,9 @@ while clip_id <= NUM_CLIPS:
         depth_images = []  # 用于遮挡检测
         frame_id = 0
 
-        # Forward：沿reference_path逐点行走
-        print("  Phase 1: Forward")
-        forward_start_frame = frame_id
+        # 沿reference_path逐点行走
+        print("  Walking to goal")
+        start_frame = frame_id
 
         # 先记录起始帧
         if "rgb" in observations:
@@ -1066,12 +874,12 @@ while clip_id <= NUM_CLIPS:
                     print(f"  ❌ Too many failed frames ({failed_frame_count}/{frame_id+1} > {allowed_failures})")
                     clip_failed = True
                     failure_reason = f"Exceeded failed frame tolerance: {failed_frame_count} frames > {allowed_failures} allowed"
-                    failure_stage = "forward_trajectory"
+                    failure_stage = "trajectory"
                 elif frame_id == 0:
                     print(f"  ❌ First frame write failed, aborting clip")
                     clip_failed = True
                     failure_reason = f"First frame RGB write failed: {str(rgb_error)}"
-                    failure_stage = "forward_init"
+                    failure_stage = "init"
 
         if "depth" in observations:
             depth = observations["depth"]
@@ -1091,12 +899,12 @@ while clip_id <= NUM_CLIPS:
                     print(f"  ❌ Too many failed frames ({failed_frame_count}/{frame_id+1} > {allowed_failures})")
                     clip_failed = True
                     failure_reason = f"Exceeded failed frame tolerance: {failed_frame_count} frames > {allowed_failures} allowed"
-                    failure_stage = "forward_trajectory"
+                    failure_stage = "trajectory"
                 elif frame_id == 0:
                     print(f"  ❌ First frame depth write failed, aborting clip")
                     clip_failed = True
                     failure_reason = f"First frame depth write failed: {str(depth_error)}"
-                    failure_stage = "forward_init"
+                    failure_stage = "init"
 
         if clip_failed:
             continue
@@ -1145,7 +953,7 @@ while clip_id <= NUM_CLIPS:
                         print(f"  ❌ Too many failed frames ({failed_frame_count}/{frame_id+1} > {allowed_failures})")
                         clip_failed = True
                         failure_reason = f"Exceeded failed frame tolerance: {failed_frame_count} frames > {allowed_failures} allowed"
-                        failure_stage = "forward_trajectory"
+                        failure_stage = "trajectory"
                         break
 
             if "depth" in observations:
@@ -1163,7 +971,7 @@ while clip_id <= NUM_CLIPS:
                         print(f"  ❌ Too many failed frames ({failed_frame_count}/{frame_id+1} > {allowed_failures})")
                         clip_failed = True
                         failure_reason = f"Exceeded failed frame tolerance: {failed_frame_count} frames > {allowed_failures} allowed"
-                        failure_stage = "forward_trajectory"
+                        failure_stage = "trajectory"
                         break
 
             if clip_failed:
@@ -1178,19 +986,19 @@ while clip_id <= NUM_CLIPS:
             if steps_taken >= max_steps_total:
                 clip_failed = True
                 failure_reason = (
-                    f"Exceeded forward steps limit ({steps_taken}/{max_steps_total}) "
+                    f"Exceeded steps limit ({steps_taken}/{max_steps_total}) "
                     f"before reaching waypoint {target_idx+1}/{len(reference_path)}"
                 )
-                failure_stage = "forward_trajectory"
+                failure_stage = "trajectory"
                 break
 
-        forward_end_frame = max(forward_start_frame, frame_id - 1)
-        forward_frames = forward_end_frame - forward_start_frame + 1
-        print(f"    {forward_frames} frames")
+        end_frame = max(start_frame, frame_id - 1)
+        num_frames = end_frame - start_frame + 1
+        print(f"    {num_frames} frames")
 
-        # ==================== 检查点1：Forward阶段失败检测 ====================
+        # ==================== 检查点1：轨迹采集失败检测 ====================
         if clip_failed:
-            print(f"  ⏩ Skipping backward phase due to forward failure: {failure_reason}")
+            print(f"  ⏩ Skipping remaining processing due to failure: {failure_reason}")
             # 清理已保存的数据
             try:
                 shutil.rmtree(clip_dir)
@@ -1209,161 +1017,32 @@ while clip_id <= NUM_CLIPS:
             })
             continue  # 跳过本clip
 
-        # Backward：沿reference_path逆序返回
-        print("  Phase 2: Backward")
-        backward_start_frame = frame_id
-        backward_targets = list(reversed(reference_path))
-        target_idx = 0
-        steps_taken = 0
-        max_steps_total = MAX_STEPS * max(1, len(backward_targets))
+        # ==================== 过滤短轨迹 ====================
+        MIN_FRAMES = 5  # 最小帧数要求
 
-        while not clip_failed and target_idx < len(backward_targets):
-            goal_point = backward_targets[target_idx]
-            action = follower.get_next_action(goal_point)
-            if action is None:
-                action = HabitatSimActions.STOP
-
-            if action == HabitatSimActions.STOP:
-                target_idx += 1
-                continue
-
-            observations = env.step(action)
-            steps_taken += 1
-
-            if "rgb" in observations:
-                rgb = observations["rgb"]
-                if rgb.shape[2] == 4:
-                    rgb = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
-                elif rgb.shape[2] == 3:
-                    rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                try:
-                    rgb_path = rgb_dir / f"{frame_id:06d}.png"
-                    success = cv2.imwrite(str(rgb_path), rgb)
-                    if not success:
-                        raise IOError(f"cv2.imwrite returned False for frame {frame_id}")
-                except Exception as rgb_error:
-                    failed_frame_count += 1
-                    print(f"    ⚠️  Frame {frame_id} RGB write failed: {rgb_error}")
-                    allowed_failures = max(2, int(0.05 * (frame_id + 1)))
-                    max_failed_frames = max(max_failed_frames, allowed_failures)
-                    if failed_frame_count > allowed_failures:
-                        print(f"  ❌ Too many failed frames ({failed_frame_count}/{frame_id+1} > {allowed_failures})")
-                        clip_failed = True
-                        failure_reason = f"Exceeded failed frame tolerance: {failed_frame_count} frames > {allowed_failures} allowed"
-                        failure_stage = "backward_trajectory"
-                        break
-
-            if "depth" in observations:
-                depth = observations["depth"]
-                depth_images.append(depth.copy())
-                try:
-                    depth_path = depth_dir / f"{frame_id:06d}.npy"
-                    np.save(str(depth_path), depth)
-                except Exception as depth_error:
-                    failed_frame_count += 1
-                    print(f"    ⚠️  Frame {frame_id} depth write failed: {depth_error}")
-                    allowed_failures = max(2, int(0.05 * (frame_id + 1)))
-                    max_failed_frames = max(max_failed_frames, allowed_failures)
-                    if failed_frame_count > allowed_failures:
-                        print(f"  ❌ Too many failed frames ({failed_frame_count}/{frame_id+1} > {allowed_failures})")
-                        clip_failed = True
-                        failure_reason = f"Exceeded failed frame tolerance: {failed_frame_count} frames > {allowed_failures} allowed"
-                        failure_stage = "backward_trajectory"
-                        break
-
-            if clip_failed:
-                break
-
-            agent_state = sim.get_agent_state()
-            trajectory_positions.append(agent_state.position.copy())
-            T_w_c = compute_camera_pose(agent_state, T_agent_cam)
-            poses.append(T_w_c.tolist())
-            frame_id += 1
-
-            if steps_taken >= max_steps_total:
-                clip_failed = True
-                failure_reason = (
-                    f"Exceeded backward steps limit ({steps_taken}/{max_steps_total}) "
-                    f"before reaching waypoint {target_idx+1}/{len(backward_targets)}"
-                )
-                failure_stage = "backward_trajectory"
-                break
-
-        backward_end_frame = max(backward_start_frame, frame_id - 1)
-        backward_frames = backward_end_frame - backward_start_frame + 1
-        print(f"    {backward_frames} frames")
-
-        # ==================== 检查点2：Backward阶段失败检测 ====================
-        if clip_failed:
-            print(f"  ⏩ Skipping remaining processing due to backward failure: {failure_reason}")
-            # 清理已保存的数据
-            try:
-                shutil.rmtree(clip_dir)
-            except Exception as cleanup_error:
-                print(f"  ⚠️  Cleanup failed: {cleanup_error}")
-
-            # 记录失败统计
-            stats["failed"] += 1
-            stats["failed_clips"].append({
-                "clip_id": clip_id,
-                "episode_id": episode.episode_id,
-                "error": failure_reason,
-                "stage": failure_stage,
-                "failed_frame_count": failed_frame_count,
-                "total_frames_attempted": frame_id
-            })
-            continue  # 跳过本clip
-
-        # ==================== 过滤短轨迹和不平衡轨迹 ====================
-        MIN_FRAMES = 5  # 单方向最小帧数要求
-
-        # 检查总帧数
-        if frame_id < MIN_FRAMES:
-            print(f"  ⚠️  Skipping: trajectory too short ({frame_id} frames < {MIN_FRAMES})")
-            # 清理已保存的RGB图像
+        # 检查轨迹长度
+        if num_frames < MIN_FRAMES:
+            print(f"  ⚠️  Skipping: trajectory too short ({num_frames} frames < {MIN_FRAMES})")
+            # 清理已保存的图像
             import shutil
             shutil.rmtree(clip_dir)
             stats["failed"] += 1
             stats["failed_clips"].append({
                 "clip_id": clip_id,
                 "episode_id": episode.episode_id,
-                "error": f"Trajectory too short ({frame_id} frames < {MIN_FRAMES})",
+                "error": f"Trajectory too short ({num_frames} frames < {MIN_FRAMES})",
                 "stage": "trajectory_length"
             })
             continue  # 跳过这个episode，不计入成功数
 
-        # 检查单方向帧数（方案E：防止F=50,B=1这种不平衡情况）
-        if forward_frames < MIN_FRAMES or backward_frames < MIN_FRAMES:
-            print(f"  ⚠️  Skipping: trajectory imbalanced (Forward={forward_frames}, Backward={backward_frames}, both need ≥{MIN_FRAMES})")
-            # 清理已保存的RGB图像
-            import shutil
-            shutil.rmtree(clip_dir)
-            stats["failed"] += 1
-            stats["failed_clips"].append({
-                "clip_id": clip_id,
-                "episode_id": episode.episode_id,
-                "error": f"Trajectory imbalanced (Forward={forward_frames}, Backward={backward_frames}, need ≥{MIN_FRAMES})",
-                "stage": "trajectory_balance"
-            })
-            continue  # 跳过这个episode，不计入成功数
-
         # ==================== 关键帧匹配 ====================
-        # 正向轨迹匹配reference_path
-        forward_positions = trajectory_positions[forward_start_frame:forward_end_frame+1]
-        forward_keyframe_indices, forward_keyframe_distances = match_keyframes_to_trajectory(
-            forward_positions, reference_path
+        # 轨迹匹配reference_path
+        positions = trajectory_positions[start_frame:end_frame+1]
+        keyframe_indices, keyframe_distances = match_keyframes_to_trajectory(
+            positions, reference_path
         )
         # 转换为全局索引
-        forward_keyframe_indices = [idx + forward_start_frame for idx in forward_keyframe_indices]
-
-        # 反向轨迹匹配reference_path（逆序）
-        backward_positions = trajectory_positions[backward_start_frame:backward_end_frame+1]
-        backward_keyframe_indices, backward_keyframe_distances = match_keyframes_to_trajectory(
-            backward_positions, reference_path[::-1]  # 逆序匹配
-        )
-        # 转换为全局索引，并reverse回来对齐到reference_path顺序
-        backward_keyframe_indices = [idx + backward_start_frame for idx in backward_keyframe_indices][::-1]
-        backward_keyframe_distances = backward_keyframe_distances[::-1]
+        keyframe_indices = [idx + start_frame for idx in keyframe_indices]
 
         # ==================== 检查点3：热力图生成前检查 ====================
         if clip_failed:
@@ -1382,7 +1061,6 @@ while clip_id <= NUM_CLIPS:
         HEATMAP_SIZE = (64, 64)
         HEATMAP_OCCLUSION_TOLERANCE = 0.25  # 深度容差，避免误判遮挡
         LOCAL_WINDOW = 5  # 局部补帧窗口，确保短期邻居也可被投影
-        PROJECTION_MARGIN = 20  # 像素级边界裕度
         MAX_VISIBLE_DISTANCE = 15.0  # 超过该距离的点忽略（减少远距离噪声）
         heatmaps_history = np.zeros((total_frames, HEATMAP_SIZE[0], HEATMAP_SIZE[1]), dtype=np.float32)
         heatmaps_future = np.zeros_like(heatmaps_history)
@@ -1395,94 +1073,21 @@ while clip_id <= NUM_CLIPS:
 
         # 获取相机内参矩阵
         intrinsics_data = compute_intrinsics(config)
-        K_mat = np.array(intrinsics_data['K'], dtype=np.float32)
         img_width = intrinsics_data['width']
         img_height = intrinsics_data['height']
 
-        # ==================== 内参尺寸校验（用实测分辨率）====================
-        # 防止YAML配置与实际观测不符
+        # ==================== 实测分辨率对齐 ====================
         h_obs, w_obs = observations["rgb"].shape[:2]
         if (w_obs != img_width) or (h_obs != img_height):
-            print(f"  ⚠️  Intrinsics size ({img_width}x{img_height}) != RGB obs ({w_obs}x{h_obs}). "
-                  "Recomputing intrinsics with observed size.")
-            # 重新计算K矩阵（使用相同的HFOV，但用实测尺寸）
-            hfov_rad = math.radians(intrinsics_data['hfov'])
-            fx = w_obs / (2.0 * math.tan(hfov_rad / 2.0))
-            vfov_rad = 2.0 * math.atan((h_obs / w_obs) * math.tan(hfov_rad / 2.0))
-            fy = h_obs / (2.0 * math.tan(vfov_rad / 2.0))
-            K_mat = np.array([[fx, 0, w_obs/2], [0, fy, h_obs/2], [0, 0, 1]], dtype=np.float32)
+            print(f"  ⚠️  Config size ({img_width}x{img_height}) != RGB obs ({w_obs}x{h_obs}). "
+                  "Updating equirect parameters with observed size.")
             img_width, img_height = w_obs, h_obs
+            intrinsics_data["width"] = w_obs
+            intrinsics_data["height"] = h_obs
+            intrinsics_data["pixels_per_radian_horizontal"] = w_obs / (2.0 * math.pi)
+            intrinsics_data["pixels_per_radian_vertical"] = h_obs / math.pi
 
-        # ==================== 自动推断Z轴方向（投票机制）====================
-        # 使用前N帧×头尾M个参考点投票，更健壮（防止起点朝向背离）
-        def robust_infer_z_sign(poses, K_mat, img_w, img_h, ref_path, N=3, M=2):
-            """使用多帧多点投票推断Z方向符号"""
-            frames = list(range(min(N, len(poses))))
-            pts = [ref_path[i] for i in [0, min(len(ref_path)-1, 1)][:M]]
-            score_neg = score_pos = 0
-
-            for f in frames:
-                T_c_w = np.linalg.inv(np.array(poses[f], dtype=np.float32))
-                for p in pts:
-                    p_cam = T_c_w @ np.array([p[0], p[1], p[2], 1.0], dtype=np.float32)
-
-                    # 测试两种Z方向约定
-                    for zneg in (True, False):
-                        front = (p_cam[2] < 0) if zneg else (p_cam[2] > 0)
-                        if not front:
-                            continue
-
-                        # 检查投影是否在画内
-                        p_img = K_mat @ p_cam[:3]
-                        if abs(p_img[2]) < 1e-3:
-                            continue
-                        u, v = p_img[0]/p_img[2], p_img[1]/p_img[2]
-                        inbound = (0 <= u < img_w) and (0 <= v < img_h)
-
-                        if inbound:
-                            if zneg:
-                                score_neg += 1
-                            else:
-                                score_pos += 1
-
-            return True if score_neg >= score_pos else False
-
-        z_forward_negative = robust_infer_z_sign(poses, K_mat, img_width, img_height, reference_path)
-        print(f"  [Auto-Infer] Z-axis convention: front={'Z<0 (OpenGL)' if z_forward_negative else 'Z>0 (CV)'}")
-
-        # ==================== Sanity Check：诊断Z轴和投影 ====================
-        # 取样检查：2帧 × 2个参考点，统计Z前向与投影可见率
-        probe_frame_indices = [forward_start_frame, min(forward_end_frame, forward_start_frame + 1)]
-        num_waypoints = len(reference_path)
-        probe_points = [reference_path[0], reference_path[-1]] if num_waypoints >= 2 else [reference_path[0]]
-
-        front_neg = front_pos = inbound = 0
-        total_probes = len(probe_frame_indices) * len(probe_points)
-
-        for probe_idx in probe_frame_indices:
-            T_w_c_probe = np.array(poses[probe_idx], dtype=np.float32)
-            T_c_w_probe = np.linalg.inv(T_w_c_probe)
-
-            for probe_point in probe_points:
-                p_world_probe = np.array([probe_point[0], probe_point[1], probe_point[2], 1.0], dtype=np.float32)
-                p_cam_probe = T_c_w_probe @ p_world_probe
-
-                # 统计Z方向
-                if p_cam_probe[2] < 0:
-                    front_neg += 1
-                elif p_cam_probe[2] > 0:
-                    front_pos += 1
-
-                # 统计投影边界
-                p_img_probe = K_mat @ p_cam_probe[:3]
-                if abs(p_img_probe[2]) > 0.01:
-                    u_probe = p_img_probe[0] / p_img_probe[2]
-                    v_probe = p_img_probe[1] / p_img_probe[2]
-                    if 0 <= u_probe < img_width and 0 <= v_probe < img_height:
-                        inbound += 1
-
-        print(f"  [Sanity Check] Probe: Zneg={front_neg}, Zpos={front_pos}, inbounds={inbound}/{total_probes}")
-        print(f"  [Sanity Check] Camera intrinsics: fx={K_mat[0,0]:.1f}, fy={K_mat[1,1]:.1f}, cx={K_mat[0,2]:.1f}, cy={K_mat[1,2]:.1f}")
+        print(f"  Camera model: equirectangular ({img_width}x{img_height})")
 
         # ==================== 预计算所有poses的逆矩阵（性能优化）====================
         print(f"  Precomputing inverse pose matrices for {len(poses)} frames...")
@@ -1499,13 +1104,12 @@ while clip_id <= NUM_CLIPS:
         )
 
         # 合并R2R路径关键帧，避免导航目标丢失
-        base_keyframes = list(set(forward_keyframe_indices + backward_keyframe_indices))
-        keyframe_indices = sorted(set(motion_keyframes + base_keyframes))
+        all_keyframes = sorted(set(motion_keyframes + keyframe_indices))
 
-        reduction_factor = total_frames / len(keyframe_indices) if len(keyframe_indices) > 0 else 1.0
-        print(f"  Selected {len(keyframe_indices)}/{total_frames} keyframes (motion-based, reduction {reduction_factor:.1f}×)")
+        reduction_factor = total_frames / len(all_keyframes) if len(all_keyframes) > 0 else 1.0
+        print(f"  Selected {len(all_keyframes)}/{total_frames} keyframes (motion-based, reduction {reduction_factor:.1f}×)")
 
-        print(f"  Generating frame-to-frame visibility heatmaps ({total_frames} frames, {len(keyframe_indices)} keyframes)...")
+        print(f"  Generating frame-to-frame visibility heatmaps ({total_frames} frames, {len(all_keyframes)} keyframes)...")
         empty_heatmap_indices = []
 
         for frame_idx in range(total_frames):
@@ -1522,9 +1126,9 @@ while clip_id <= NUM_CLIPS:
             heatmap_future_local = np.zeros(HEATMAP_SIZE, dtype=np.float32)
             visibility_history = 0
             visibility_future = 0
-            stats_reject = {"behind": 0, "oob": 0, "occluded": 0, "dist": 0}
+            stats_reject = {"oob": 0, "occluded": 0, "dist": 0}
 
-            candidates_to_project = set(keyframe_indices)
+            candidates_to_project = set(all_keyframes)
             start_local = max(0, frame_idx - LOCAL_WINDOW)
             end_local = min(total_frames, frame_idx + LOCAL_WINDOW + 1)
             for l_idx in range(start_local, end_local):
@@ -1539,25 +1143,19 @@ while clip_id <= NUM_CLIPS:
                                          camera_centers[other_idx][2],
                                          1.0], dtype=np.float32)
                 p_cam = T_c_w @ other_center
-
-                is_front = (p_cam[2] < 0) if z_forward_negative else (p_cam[2] > 0)
-                if not is_front:
-                    stats_reject["behind"] += 1
+                distance = float(np.linalg.norm(p_cam[:3]))
+                if distance < 1e-4:
                     continue
-
-                p_img = K_mat @ p_cam[:3]
-                if abs(p_img[2]) < 1e-3:
+                if distance > MAX_VISIBLE_DISTANCE:
+                    stats_reject["dist"] += 1
                     continue
-                u = p_img[0] / p_img[2]
-                v = p_img[1] / p_img[2]
-                if not (-PROJECTION_MARGIN <= u < img_width + PROJECTION_MARGIN and
-                        -PROJECTION_MARGIN <= v < img_height + PROJECTION_MARGIN):
+                projection = project_point_equirect(p_cam, img_width, img_height)
+                if projection is None:
                     stats_reject["oob"] += 1
                     continue
-
-                expected_depth = float(abs((-p_cam[2]) if z_forward_negative else p_cam[2]))
-                if expected_depth > MAX_VISIBLE_DISTANCE:
-                    stats_reject["dist"] += 1
+                u, v = projection
+                if not (0.0 <= v < img_height):
+                    stats_reject["oob"] += 1
                     continue
 
                 if depth_plane is not None:
@@ -1571,23 +1169,20 @@ while clip_id <= NUM_CLIPS:
                     if not np.isfinite(observed_depth) or observed_depth <= 0:
                         stats_reject["occluded"] += 1
                         continue
-                    if observed_depth < expected_depth - HEATMAP_OCCLUSION_TOLERANCE:
+                    if observed_depth < distance - HEATMAP_OCCLUSION_TOLERANCE:
                         stats_reject["occluded"] += 1
                         continue
 
-                distance = expected_depth
                 adaptive_sigma = compute_adaptive_sigma(
                     distance=distance,
-                    fx=K_mat[0, 0],
                     object_size_3d=0.5,
                     heatmap_width=HEATMAP_SIZE[1],
-                    img_width=img_width,
                     min_sigma=0.8,
                     max_sigma=6.0
                 )
                 u_hm = u * HEATMAP_SIZE[1] / img_width
                 v_hm = v * HEATMAP_SIZE[0] / img_height
-                if other_idx in keyframe_indices:
+                if other_idx in all_keyframes:
                     temporal_rank = max(0, abs(frame_idx - other_idx) // 5)
                 else:
                     temporal_rank = 0
@@ -1655,20 +1250,17 @@ while clip_id <= NUM_CLIPS:
         with open(clip_dir / "poses.json", "w") as f:
             json.dump(poses, f, indent=2)
 
-        # 2. 保存内参（使用最终实际使用的K_mat，而不是重新计算）
-        # 关键：如果前面重算过K_mat（尺寸校验），这里必须用最终版本
-        hfov_deg_out = math.degrees(2.0 * math.atan(img_width / (2.0 * K_mat[0, 0])))
-        vfov_deg_out = math.degrees(2.0 * math.atan(img_height / (2.0 * K_mat[1, 1])))
+        # 2. 保存内参（Equirectangular参数）
         intrinsics_out = {
-            "fx": float(K_mat[0, 0]),
-            "fy": float(K_mat[1, 1]),
-            "cx": float(K_mat[0, 2]),
-            "cy": float(K_mat[1, 2]),
-            "K": K_mat.tolist(),
+            "projection": "equirectangular",
             "width": int(img_width),
             "height": int(img_height),
-            "hfov": float(hfov_deg_out),
-            "vfov": float(vfov_deg_out),
+            "hfov": float(intrinsics_data["hfov"]),
+            "vfov": float(intrinsics_data["vfov"]),
+            "pixels_per_radian": {
+                "horizontal": float(intrinsics_data["pixels_per_radian_horizontal"]),
+                "vertical": float(intrinsics_data["pixels_per_radian_vertical"])
+            }
         }
         with open(clip_dir / "intrinsics.json", "w") as f:
             json.dump(intrinsics_out, f, indent=2)
@@ -1690,33 +1282,24 @@ while clip_id <= NUM_CLIPS:
             "scene_id": scene_name,
             "instruction": instruction_text,
 
-            "sampling_strategy": "bidirectional_walk",
+            "sampling_strategy": "walk_to_goal",
             "num_frames": frame_id,
 
-            # 正反向分段信息
-            "forward_segment": {
-                "start_frame": forward_start_frame,
-                "end_frame": forward_end_frame,
-                "num_frames": forward_frames
-            },
-            "backward_segment": {
-                "start_frame": backward_start_frame,
-                "end_frame": backward_end_frame,
-                "num_frames": backward_frames
+            # 轨迹信息
+            "trajectory": {
+                "start_frame": start_frame,
+                "end_frame": end_frame,
+                "num_frames": num_frames
             },
 
             # R2R关键节点信息
             "reference_path": reference_path,
-            "forward_keyframe_indices": forward_keyframe_indices,
-            "forward_keyframe_distances": forward_keyframe_distances,
-            "backward_keyframe_indices": backward_keyframe_indices,
-            "backward_keyframe_distances": backward_keyframe_distances,
+            "keyframe_indices": keyframe_indices,
+            "keyframe_distances": keyframe_distances,
 
             # 质量指标
-            "forward_max_keyframe_distance": float(np.max(forward_keyframe_distances)),
-            "forward_mean_keyframe_distance": float(np.mean(forward_keyframe_distances)),
-            "backward_max_keyframe_distance": float(np.max(backward_keyframe_distances)),
-            "backward_mean_keyframe_distance": float(np.mean(backward_keyframe_distances)),
+            "max_keyframe_distance": float(np.max(keyframe_distances)),
+            "mean_keyframe_distance": float(np.mean(keyframe_distances)),
 
             # 热力图信息
             "num_heatmaps": total_frames,
@@ -1748,21 +1331,18 @@ while clip_id <= NUM_CLIPS:
                 "object_size_3d": 0.3,  # 3D不确定半径（米）
                 "min_sigma": 0.5,  # 最小sigma（热力图像素）
                 "max_sigma": 5.0,  # 最大sigma（热力图像素）
-                "formula": "sigma = (fx * object_size_3d / distance) * (heatmap_width / img_width) / 3.0"
+                "formula": "sigma = (atan(object_size_3d / distance) * heatmap_width / (2*pi)) / 3.0"
             },
         }
 
         # ==================== 计算质量控制信息（自适应阈值）====================
         # 在保存meta.json之前计算，以便记录到元数据中
         MIN_VALID_RATIO, quality_tier = compute_adaptive_min_valid_ratio(
-            forward_keyframe_distances,
-            backward_keyframe_distances
+            keyframe_distances
         )
 
         # 计算平均关键帧距离
-        forward_mean_dist = float(np.mean(forward_keyframe_distances))
-        backward_mean_dist = float(np.mean(backward_keyframe_distances))
-        avg_keyframe_dist = (forward_mean_dist + backward_mean_dist) / 2.0
+        avg_keyframe_dist = float(np.mean(keyframe_distances))
 
         valid_ratio_history = valid_history / total_frames if total_frames > 0 else 0.0
         valid_ratio_future = valid_future / total_frames if total_frames > 0 else 0.0
