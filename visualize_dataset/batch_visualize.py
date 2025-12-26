@@ -68,9 +68,10 @@ def visualize_clip_wrapper(clip_path: Path, output_base: Path,
     output_dir = output_base / scene_name / clip_name
 
     # Build command
+    heatmaps_script = (Path(__file__).resolve().parent / 'visualize_heatmaps.py')
     cmd = [
         sys.executable,  # Use same Python interpreter
-        'visualize_heatmaps.py',
+        str(heatmaps_script),
         '--clip_path', str(clip_path),
         '--output_dir', str(output_dir),
         '--alpha', str(alpha),
@@ -240,7 +241,7 @@ def create_index_html(output_dir: Path, clips_info: List[dict]) -> None:
             # Make relative path
             rel_path = Path(clip['image_path']).relative_to(output_dir)
             html_content += f"""
-        <img src="{rel_path}" alt="Heatmap visualization">
+        <img src="{rel_path.as_posix()}" alt="Heatmap visualization">
 """
 
         html_content += """
