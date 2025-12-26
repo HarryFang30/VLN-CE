@@ -403,7 +403,7 @@ def parse_args():
                         help='Habitat 配置文件路径')
     parser.add_argument('--output', type=str, default="/root/autodl-tmp/dataset_with_actions",
                         help='输出目录')
-    parser.add_argument('--split', type=str, default="train", choices=['train', 'val', 'test'],
+    parser.add_argument('--split', type=str, default="train", choices=['train', 'val', 'val_seen', 'val_unseen', 'test'],
                         help='数据集划分')
     parser.add_argument('--num-clips', type=int, default=1000,
                         help='采集的 clip 数量')
@@ -916,31 +916,19 @@ while clip_id <= NUM_CLIPS:
         )
         keyframe_indices = [idx + start_frame for idx in keyframe_indices]
 
-        # ==================== 生成热力图（简化版，与原始脚本相同）====================
+        # 验证帧数
         total_frames = len(poses)
         if total_frames == 0:
             clip_failed = True
             failure_reason = "No valid frames collected"
             failure_stage = "trajectory"
             raise Exception(failure_reason)
-
-        HEATMAP_SIZE = (64, 64)
-        HEATMAP_OCCLUSION_TOLERANCE = 0.25
-        LOCAL_WINDOW = 5
-        MAX_VISIBLE_DISTANCE = 15.0
-        heatmaps_history = np.zeros((total_frames, HEATMAP_SIZE[0], HEATMAP_SIZE[1]), dtype=np.float32)
-        heatmaps_future = np.zeros_like(heatmaps_history)
-        mask_history = np.zeros(total_frames, dtype=np.float32)
-        mask_future = np.zeros(total_frames, dtype=np.float32)
-        mask = np.zeros(total_frames, dtype=np.float32)
-        visibility_counts_history = np.zeros(total_frames, dtype=np.int32)
-        visibility_counts_future = np.zeros(total_frames, dtype=np.int32)
-        visibility_counts = np.zeros(total_frames, dtype=np.int32)
-
+        
+        # 计算内参（用于 meta.json）
         intrinsics_data = compute_intrinsics(config)
         img_width = intrinsics_data['width']
         img_height = intrinsics_data['height']
-
+        
         h_obs, w_obs = observations["rgb"].shape[:2]
         if (w_obs != img_width) or (h_obs != img_height):
             img_width, img_height = w_obs, h_obs
@@ -948,115 +936,8 @@ while clip_id <= NUM_CLIPS:
             intrinsics_data["height"] = h_obs
             intrinsics_data["pixels_per_radian_horizontal"] = w_obs / (2.0 * math.pi)
             intrinsics_data["pixels_per_radian_vertical"] = h_obs / math.pi
-
-        pose_mats = [np.array(pose, dtype=np.float32) for pose in poses]
-        poses_inv = [np.linalg.inv(mat) for mat in pose_mats]
-        camera_centers = [mat[:3, 3].copy() for mat in pose_mats]
-
-        motion_keyframes = select_keyframes_motion_based(poses=poses, min_dist=0.5, min_angle_deg=15.0)
-        all_keyframes = sorted(set(motion_keyframes + keyframe_indices))
-
-        print(f"  Generating heatmaps ({total_frames} frames, {len(all_keyframes)} keyframes)...")
         
-        for frame_idx in range(total_frames):
-            depth_img = depth_images[frame_idx] if frame_idx < len(depth_images) else None
-            if depth_img is not None and depth_img.ndim == 3 and depth_img.shape[-1] == 1:
-                depth_plane = depth_img[:, :, 0]
-            else:
-                depth_plane = depth_img
-            depth_h = depth_plane.shape[0] if depth_plane is not None else None
-            depth_w = depth_plane.shape[1] if depth_plane is not None else None
-
-            T_c_w = poses_inv[frame_idx]
-            heatmap_history_local = np.zeros(HEATMAP_SIZE, dtype=np.float32)
-            heatmap_future_local = np.zeros(HEATMAP_SIZE, dtype=np.float32)
-            visibility_history = 0
-            visibility_future = 0
-
-            candidates_to_project = set(all_keyframes)
-            start_local = max(0, frame_idx - LOCAL_WINDOW)
-            end_local = min(total_frames, frame_idx + LOCAL_WINDOW + 1)
-            for l_idx in range(start_local, end_local):
-                candidates_to_project.add(l_idx)
-
-            for other_idx in sorted(candidates_to_project):
-                if other_idx == frame_idx:
-                    continue
-
-                other_center = np.array([camera_centers[other_idx][0],
-                                         camera_centers[other_idx][1],
-                                         camera_centers[other_idx][2],
-                                         1.0], dtype=np.float32)
-                p_cam = T_c_w @ other_center
-                distance = float(np.linalg.norm(p_cam[:3]))
-                if distance < 1e-4 or distance > MAX_VISIBLE_DISTANCE:
-                    continue
-                projection = project_point_equirect(p_cam, img_width, img_height)
-                if projection is None:
-                    continue
-                u, v = projection
-                if not (0.0 <= v < img_height):
-                    continue
-
-                if depth_plane is not None:
-                    u_d = u * (depth_w / img_width)
-                    v_d = v * (depth_h / img_height)
-                    u_int = int(np.clip(u_d, 0, depth_w - 1))
-                    v_int = int(np.clip(v_d, 0, depth_h - 1))
-                    observed_depth = float(depth_plane[v_int, u_int])
-                    if depth_normalize:
-                        observed_depth = depth_min + observed_depth * (depth_max - depth_min)
-                    if not np.isfinite(observed_depth) or observed_depth <= 0:
-                        continue
-                    if observed_depth < distance - HEATMAP_OCCLUSION_TOLERANCE:
-                        continue
-
-                adaptive_sigma = compute_adaptive_sigma(
-                    distance=distance, object_size_3d=0.5, heatmap_width=HEATMAP_SIZE[1],
-                    min_sigma=0.8, max_sigma=6.0
-                )
-                u_hm = u * HEATMAP_SIZE[1] / img_width
-                v_hm = v * HEATMAP_SIZE[0] / img_height
-                temporal_rank = max(0, abs(frame_idx - other_idx) // 5) if other_idx in all_keyframes else 0
-                
-                if other_idx < frame_idx:
-                    target_heatmap = heatmap_history_local
-                    visibility_history += 1
-                else:
-                    target_heatmap = heatmap_future_local
-                    visibility_future += 1
-                    
-                draw_nerf_ripple_point(heatmap=target_heatmap, center=(u_hm, v_hm),
-                                       sigma=adaptive_sigma, frame_rank=temporal_rank)
-
-            max_hist = heatmap_history_local.max()
-            if visibility_history > 0 and max_hist > 0:
-                heatmap_history_local /= max_hist
-                mask_history[frame_idx] = 1.0
-            elif visibility_history > 0:
-                mask_history[frame_idx] = 1.0
-
-            max_future = heatmap_future_local.max()
-            if visibility_future > 0 and max_future > 0:
-                heatmap_future_local /= max_future
-                mask_future[frame_idx] = 1.0
-            elif visibility_future > 0:
-                mask_future[frame_idx] = 1.0
-
-            heatmaps_history[frame_idx] = heatmap_history_local
-            heatmaps_future[frame_idx] = heatmap_future_local
-            visibility_counts_history[frame_idx] = visibility_history
-            visibility_counts_future[frame_idx] = visibility_future
-
-            visibility = visibility_history + visibility_future
-            visibility_counts[frame_idx] = visibility
-            if mask_history[frame_idx] > 0 or mask_future[frame_idx] > 0:
-                mask[frame_idx] = 1.0
-
-        valid_history = int(mask_history.sum())
-        valid_future = int(mask_future.sum())
-        valid_count = int(mask.sum())
-        print(f"  ✅ Generated {total_frames} heatmaps (history={valid_history}, future={valid_future})")
+        print(f"  ✅ Collected {total_frames} frames (热力图将在训练时动态计算)")
 
         # ==================== 保存数据 ====================
         # 1. 保存位姿
@@ -1078,17 +959,7 @@ while clip_id <= NUM_CLIPS:
         with open(clip_dir / "intrinsics.json", "w") as f:
             json.dump(intrinsics_out, f, indent=2)
 
-        # 3. 保存热力图
-        np.save(clip_dir / "heatmaps_history.npy", heatmaps_history)
-        np.save(clip_dir / "heatmaps_future.npy", heatmaps_future)
-        np.save(clip_dir / "mask_history.npy", mask_history)
-        np.save(clip_dir / "mask_future.npy", mask_future)
-        np.save(clip_dir / "mask.npy", mask)
-        np.save(clip_dir / "visibility_counts_history.npy", visibility_counts_history)
-        np.save(clip_dir / "visibility_counts_future.npy", visibility_counts_future)
-        np.save(clip_dir / "visibility_counts.npy", visibility_counts)
-
-        # 🆕 4. 保存动作数据
+        # 3. 保存动作数据
         np.save(clip_dir / "actions.npy", actions_2d)  # [T, 2] float32
         np.save(clip_dir / "discrete_actions.npy", discrete_actions_arr)  # [T] int32
         print(f"  ✨ Saved actions.npy [{actions_2d.shape}] and discrete_actions.npy [{discrete_actions_arr.shape}]")
@@ -1114,15 +985,7 @@ while clip_id <= NUM_CLIPS:
             "keyframe_distances": keyframe_distances,
             "max_keyframe_distance": float(np.max(keyframe_distances)),
             "mean_keyframe_distance": float(np.mean(keyframe_distances)),
-            "num_heatmaps": total_frames,
-            "heatmap_size": list(HEATMAP_SIZE),
-            "valid_heatmaps": {
-                "history": valid_history,
-                "future": valid_future,
-                "either": valid_count
-            },
-            "heatmap_type": "frame_to_frame_visibility_split",
-            # 🆕 动作信息
+            # 动作信息
             "actions": {
                 "num_actions": len(actions_2d),
                 "action_dim": 2,
@@ -1137,7 +1000,6 @@ while clip_id <= NUM_CLIPS:
                 }
             },
             "quality_control": {
-                "valid_ratio": float(valid_count / total_frames) if total_frames > 0 else 0.0,
                 "min_valid_ratio_used": float(MIN_VALID_RATIO),
                 "avg_keyframe_distance": float(avg_keyframe_dist),
                 "quality_tier": quality_tier
