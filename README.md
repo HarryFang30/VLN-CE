@@ -222,3 +222,252 @@ python collect.py --config habitat_extensions/config/vlnce_collect.yaml --output
 # 3) 完成后分析（可选）
 python analyze.py
 ```
+
+---
+
+## 数据采集流程与动作语义（重要）
+
+### 采集策略
+
+`collect.py` 的核心采集流程：
+
+1. **环境初始化**
+   - 加载 Habitat-Sim 环境和 VLN-CE 数据集
+   - 初始化 `ShortestPathFollower` 用于生成最优路径
+   - 配置 RGB 和 Depth 传感器（Equirectangular 全景图）
+
+2. **轨迹采集**
+   - 对每个 episode，从起点出发，使用 `ShortestPathFollower` 导航到目标
+   - 每执行一个动作前记录当前帧和动作
+   - 动作执行后记录下一帧
+   - 直到到达目标或超过最大步数
+
+3. **动作记录**
+   - **离散动作**：直接从 `ShortestPathFollower.get_next_action()` 获取
+   - **连续动作**：从相邻帧的位姿矩阵差分计算 2D 位移
+
+### 动作数据语义（核心）
+
+#### 动作索引约定
+
+**重要**：所有动作数据遵循统一的时序语义：
+
+```
+action[i] = 从 frame[i] 到 frame[i+1] 的动作
+```
+
+这意味着：
+- 给定当前帧 `frame[i]` 和历史观测
+- 模型应该预测 `action[i]`
+- 执行 `action[i]` 后到达 `frame[i+1]`
+
+#### 1. 连续动作 (`actions.npy`)
+
+**文件格式**：
+- 形状：`[T, 2]` float32 数组
+- T = clip 的总帧数
+
+**数据内容**：
+- `action[i] = [dx, dy]`：从 `frame[i]` 到 `frame[i+1]` 的 agent-local 2D 位移
+  - `dx`：X 方向位移（agent 坐标系，右为正）
+  - `dy`：Z 方向位移（agent 坐标系，前为正）
+
+**计算方式**：
+```python
+def compute_2d_action_from_poses(pose_before, pose_after):
+    """从相邻位姿计算 2D 连续动作"""
+    # 计算相对变换
+    T_rel = inv(pose_before) @ pose_after
+    
+    # 提取平移分量（在 before 帧的局部坐标系下）
+    dx = T_rel[0, 3]  # X 方向（右/左）
+    dz = T_rel[2, 3]  # Z 方向（后/前）
+    
+    # Habitat 坐标系：-Z 是前方，所以 dy = -dz
+    dy = -dz
+    
+    return np.array([dx, dy], dtype=np.float32)
+```
+
+**坐标系说明**：
+- Habitat Agent-local 坐标系：
+  - X 轴：向右（正方向）
+  - Y 轴：向上（正方向）
+  - Z 轴：向后（-Z 是前方）
+- 返回的 `(dx, dy)` 中：
+  - `dx`：左右移动（右为正）
+  - `dy`：前后移动（前为正）
+
+**特殊情况**：
+- `action[T-1] = [0.0, 0.0]`：最后一帧没有后续帧，动作为零向量
+
+#### 2. 离散动作 (`discrete_actions.npy`)
+
+**文件格式**：
+- 形状：`[T]` int32 数组
+
+**数据内容**：
+- `discrete_action[i]`：从 `frame[i]` 到 `frame[i+1]` 的离散动作类型
+- 动作枚举（来自 `HabitatSimActions`）：
+  - `0` = **STOP**（停止，到达目标）
+  - `1` = **MOVE_FORWARD**（前进）
+  - `2` = **TURN_LEFT**（左转）
+  - `3` = **TURN_RIGHT**（右转）
+
+**数据来源**：
+- 直接来自 `ShortestPathFollower.get_next_action(waypoint)`
+- 保证是从当前位置到目标的最优动作序列
+
+**特殊情况**：
+- `discrete_action[T-1] = 0` (STOP)：最后一帧标记为停止
+
+#### 3. 位姿数据 (`poses.json`)
+
+**文件格式**：
+- 形状：`[T, 4, 4]` 位姿矩阵列表（JSON 格式）
+
+**数据内容**：
+- `pose[i]`：第 i 帧的相机到世界坐标系的变换矩阵 `T_world_camera`
+- 4×4 齐次变换矩阵：
+  ```
+  [R | t]
+  [0 | 1]
+  ```
+  - `R`：3×3 旋转矩阵
+  - `t`：3×1 平移向量（世界坐标系中的相机位置）
+
+**用途**：
+- 用于计算连续动作（相邻帧位姿差分）
+- 用于计算热力图（历史帧在当前帧中的投影位置）
+
+### 训练时的使用方式
+
+#### 滑动窗口数据集
+
+训练代码（`VLNSlidingWindowDataset`）将每个 clip 扩展为多个训练样本：
+
+```python
+# 对于 T 帧的 clip，生成 T - min_history 个样本
+for current_t in range(min_history, T):
+    sample = {
+        "history_frames": frames[0:current_t],      # 历史观测
+        "current_frame": frames[current_t],          # 当前帧
+        "action": actions[current_t],                # 要预测的动作
+        "discrete_action": discrete_actions[current_t],
+        "instruction": instruction,
+        ...
+    }
+```
+
+#### 动作预测的监督学习
+
+**任务定义**：
+- 输入：历史帧 + 当前帧 + 指令
+- 输出：
+  1. **连续动作** `(dx, dy)`：预测下一步的 2D 位移
+  2. **STOP 预测**：二分类，判断是否应该停止
+
+**为什么分离连续动作和离散动作？**
+
+1. **连续动作** (`dx`, `dy`) 适合用扩散模型学习：
+   - 可以捕捉运动的多模态性（同一个指令可能有多种合理的路径）
+   - 扩散模型生成平滑、自然的运动轨迹
+   - 训练使用 `DiffusionActionHead`
+
+2. **STOP 动作** 是稀疏的离散事件：
+   - 在整个数据集中只占约 0.6% 的动作
+   - 很难用连续回归准确预测这种离散的、稀有的事件
+   - 使用单独的二分类头 `StopPredictionHead`，并采用 Focal Loss 处理类别不平衡
+
+3. **混合架构在 VLN 任务中效果更好**：
+   - 扩散模型：负责预测"怎么走"（连续位移）
+   - 分类头：负责预测"何时停"（到达目标）
+
+### 数据质量控制
+
+采集脚本内置多层质量检查：
+
+1. **Episode 验证**：
+   - 检查 goals、reference_path、instruction 等必需字段
+   - 跳过缺失关键数据的 episode
+
+2. **轨迹长度**：
+   - 最小帧数：5 帧
+   - 最大步数：由 `--max-steps` 参数控制
+
+3. **关键帧匹配**：
+   - 将采集的轨迹与 VLN-CE 的 reference_path 对齐
+   - 计算平均偏差，自动调整质量阈值
+   - 偏差 < 0.3m：excellent，0.3-0.8m：high，0.8-1.5m：medium
+
+4. **I/O 健康检查**：
+   - 每个 clip 开始前验证磁盘读写
+   - 允许 5% 的帧保存失败（增强鲁棒性）
+
+5. **动作统计**：
+   - 自动计算每个 clip 的动作范围 `(dx_min, dx_max, dy_min, dy_max)`
+   - 记录在 `meta.json` 中
+   - 训练时用于动作归一化
+
+### meta.json 结构说明
+
+每个 clip 的 `meta.json` 包含完整的元数据：
+
+```json
+{
+  "episode_id": "...",
+  "trajectory_id": "...",
+  "scene_id": "...",
+  "instruction": "...",
+  "num_frames": 42,
+  
+  "actions": {
+    "num_actions": 42,
+    "action_dim": 2,
+    "action_semantic": "action[i] = from frame[i] to frame[i+1]",
+    "action_format": "(dx, dy) - agent-local 2D displacement",
+    "discrete_action_format": "HabitatSimActions (0=STOP, 1=FORWARD, 2=LEFT, 3=RIGHT)",
+    "last_action_note": "action[T-1] = (0,0) / STOP since no next frame",
+    "stats": {
+      "dx": {"min": -0.05, "max": 0.03, "mean": 0.001},
+      "dy": {"min": 0.0, "max": 0.25, "mean": 0.18}
+    },
+    "files": {
+      "continuous": "actions.npy",
+      "discrete": "discrete_actions.npy"
+    }
+  },
+  
+  "reference_path": [[x1, y1, z1], [x2, y2, z2], ...],
+  "keyframe_indices": [0, 8, 15, 23, 41],
+  "keyframe_distances": [0.15, 0.23, 0.18, 0.12, 0.08],
+  
+  "quality_control": {
+    "min_valid_ratio_used": 0.70,
+    "avg_keyframe_distance": 0.152,
+    "quality_tier": "high"
+  }
+}
+```
+
+### 常见问题
+
+**Q: 为什么最后一帧的动作是 (0, 0) / STOP？**
+
+A: 因为动作定义为"从当前帧到下一帧"，最后一帧没有后续帧，所以动作无效。训练时会通过 `action_valid=0` 标记忽略最后一帧的动作损失。
+
+**Q: 动作的坐标系是什么？**
+
+A: Agent-local 坐标系（以当前帧的 agent 朝向为参考）。`dx` 是左右移动，`dy` 是前后移动。这样模型学习的是相对运动，而不是全局坐标，更符合第一人称导航的直觉。
+
+**Q: 离散动作和连续动作是否一致？**
+
+A: 是的。离散动作（如 MOVE_FORWARD）在执行时会产生对应的连续位移（如 `dy ≈ 0.25`）。两者都是从相同的 Habitat 仿真中采集的，保证了一致性。
+
+**Q: 如何使用这些动作数据训练模型？**
+
+A: 参考 `/root/VLN/Project` 中的训练代码：
+- 使用 `VLNSlidingWindowDataset` 加载数据
+- 使用 `DiffusionActionHead` 预测连续动作
+- 使用 `StopPredictionHead` 预测 STOP 动作
+- 详见 `/root/VLN/Project/README.md`
