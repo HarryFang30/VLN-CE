@@ -473,34 +473,20 @@ for i, ep in enumerate(dataset.episodes):
 print(f"🏠 Found {len(episodes_by_scene)} scenes")
 print(f"   Top 5 scenes: {list(episodes_by_scene.keys())[:5]}")
 
+# 🚀 优化：按场景分组采集，减少场景切换次数
 all_episode_indices = []
 scene_names = list(episodes_by_scene.keys())
 random.seed(42)
 random.shuffle(scene_names)
 
-episodes_available_by_scene = {scene: list(eps) for scene, eps in episodes_by_scene.items()}
-scene_exhausted_count = {}
+# 按场景顺序添加所有 episode（同一场景的 episode 连续排列）
+for scene in scene_names:
+    scene_episodes = list(episodes_by_scene[scene])
+    random.shuffle(scene_episodes)  # 场景内随机顺序
+    all_episode_indices.extend(scene_episodes)
 
-scene_idx = 0
-for _ in range(NUM_CLIPS * 5):
-    if len(all_episode_indices) >= NUM_CLIPS * 5:
-        break
-    scene = scene_names[scene_idx % len(scene_names)]
-
-    if episodes_available_by_scene[scene]:
-        ep_idx = random.choice(episodes_available_by_scene[scene])
-        episodes_available_by_scene[scene].remove(ep_idx)
-        all_episode_indices.append(ep_idx)
-
-        if not episodes_available_by_scene[scene]:
-            episodes_available_by_scene[scene] = list(episodes_by_scene[scene])
-            scene_exhausted_count[scene] = scene_exhausted_count.get(scene, 0) + 1
-            if scene_exhausted_count[scene] == 1:
-                print(f"  ⚠️  Scene '{scene}' exhausted ({len(episodes_by_scene[scene])} episodes), replenishing for 2nd pass")
-
-    scene_idx += 1
-
-print(f"✅ Prepared {len(all_episode_indices)} episode indices for collection")
+print(f"✅ Prepared {len(all_episode_indices)} episode indices (grouped by scene for faster collection)")
+print(f"   Scenes order: {scene_names[:5]}... ({len(scene_names)} total)")
 
 output_root = Path(OUTPUT_ROOT)
 output_root.mkdir(parents=True, exist_ok=True)
@@ -514,6 +500,21 @@ if progress_file.exists():
         start_clip = progress.get("next_clip_to_try", 1)
         start_episode_attempt = progress.get("next_episode_attempt")
     print(f"📂 Resuming from clip {start_clip}")
+
+# 🆕 扫描已采集的 episode_id，避免重复采集
+collected_episode_ids = set()
+split_dir = output_root / SPLIT
+if split_dir.exists():
+    for meta_file in split_dir.rglob("meta.json"):
+        try:
+            with open(meta_file, "r") as f:
+                meta_data = json.load(f)
+                ep_id = meta_data.get("episode_id")
+                if ep_id:
+                    collected_episode_ids.add(str(ep_id))
+        except:
+            pass
+    print(f"📋 Found {len(collected_episode_ids)} already collected episode_ids (will skip duplicates)")
 
 stats = {
     "successful": 0,
@@ -569,41 +570,29 @@ while clip_id <= NUM_CLIPS:
         episode_attempt += 1
         episode = dataset.episodes[episode_idx]
 
+        # 🆕 检查是否已采集过该 episode，跳过重复
+        if str(episode.episode_id) in collected_episode_ids:
+            print(f"  ⏭️  Skipping already collected episode {episode.episode_id}")
+            continue
+
+        current_scene = episode.scene_id.split("/")[-1].replace(".glb", "")
+        
+        # 检查是否切换场景
+        if not hasattr(env, '_last_scene') or env._last_scene != current_scene:
+            print(f"  🔄 Loading scene: {current_scene}")
+        
         env._current_episode = episode
         observations = env.reset()
+        
+        # 只在场景变化时重建 follower
+        if not hasattr(env, '_last_scene') or env._last_scene != current_scene:
+            sim = env.sim
+            follower = ShortestPathFollower(sim, goal_radius=0.2, return_one_hot=False)
+            env._last_scene = current_scene
 
         missing = [k for k in ("rgb", "depth") if k not in observations]
         if missing:
             raise RuntimeError(f"Missing observations: {missing}.")
-
-        if clip_id == start_clip and "depth" in observations:
-            sample_depth = observations["depth"]
-            sample_flat = sample_depth.reshape(-1).astype(np.float32)
-            finite_mask = np.isfinite(sample_flat)
-            if np.any(finite_mask):
-                finite_values = sample_flat[finite_mask]
-                sample_min = float(np.min(finite_values))
-                sample_max = float(np.max(finite_values))
-
-                normalized_hint = (sample_min >= -1e-3) and (sample_max <= 1.02)
-                metric_hint = sample_max > depth_max + 1e-3
-
-                if depth_normalize:
-                    if metric_hint:
-                        print(f"  ⚠️  Depth sanity check: max={sample_max:.2f} > depth_max={depth_max:.2f}")
-                        print(f"      Depth appears to be metric already. Disabling normalization globally.")
-                        depth_normalize = False
-                else:
-                    if normalized_hint:
-                        print(f"  ⚠️  Depth sanity check: range≈[{sample_min:.3f}, {sample_max:.3f}] ⊂ [0,1]")
-                        print(f"      Depth appears to be normalized. Enabling normalization globally.")
-                        depth_normalize = True
-
-        current_scene = episode.scene_id.split("/")[-1].replace(".glb", "")
-        if hasattr(env, '_last_scene') and env._last_scene != current_scene:
-            sim = env.sim
-            follower = ShortestPathFollower(sim, goal_radius=0.2, return_one_hot=False)
-        env._last_scene = current_scene
 
         scene_name = current_scene
 
@@ -708,57 +697,23 @@ while clip_id <= NUM_CLIPS:
         print("  Walking to goal")
         start_frame = frame_id
 
-        # 先记录起始帧
+        # 先记录起始帧（使用异步 IO 加速）
         if "rgb" in observations:
             rgb = observations["rgb"]
             if rgb.shape[2] == 4:
                 rgb = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
             elif rgb.shape[2] == 3:
                 rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            try:
-                rgb_path = rgb_dir / f"{frame_id:06d}.png"
-                success = cv2.imwrite(str(rgb_path), rgb)
-                if not success:
-                    raise IOError(f"cv2.imwrite returned False for frame {frame_id}")
-                if frame_id == 0:
-                    if not rgb_path.exists() or rgb_path.stat().st_size == 0:
-                        raise IOError("First frame RGB write verification failed: file missing or empty")
-            except Exception as rgb_error:
-                failed_frame_count += 1
-                print(f"    ⚠️  Frame {frame_id} RGB write failed: {rgb_error}")
-                allowed_failures = max(2, int(0.05 * (frame_id + 1)))
-                max_failed_frames = max(max_failed_frames, allowed_failures)
-                if failed_frame_count > allowed_failures:
-                    clip_failed = True
-                    failure_reason = f"Exceeded failed frame tolerance"
-                    failure_stage = "trajectory"
-                elif frame_id == 0:
-                    clip_failed = True
-                    failure_reason = f"First frame RGB write failed"
-                    failure_stage = "init"
+            # 🚀 异步保存 RGB（JPEG 格式，质量 95%，速度更快）
+            rgb_path = rgb_dir / f"{frame_id:06d}.jpg"
+            io_futures.append(executor.submit(cv2.imwrite, str(rgb_path), rgb.copy(), [cv2.IMWRITE_JPEG_QUALITY, 95]))
 
         if "depth" in observations:
             depth = observations["depth"]
             depth_images.append(depth.copy())
-            try:
-                depth_path = depth_dir / f"{frame_id:06d}.npy"
-                np.save(str(depth_path), depth)
-                if frame_id == 0:
-                    if not depth_path.exists() or depth_path.stat().st_size == 0:
-                        raise IOError("First frame depth write verification failed")
-            except Exception as depth_error:
-                failed_frame_count += 1
-                if failed_frame_count > max(2, int(0.05 * (frame_id + 1))):
-                    clip_failed = True
-                    failure_reason = f"Exceeded failed frame tolerance"
-                    failure_stage = "trajectory"
-                elif frame_id == 0:
-                    clip_failed = True
-                    failure_reason = f"First frame depth write failed"
-                    failure_stage = "init"
-
-        if clip_failed:
-            continue
+            # 🚀 异步保存 depth
+            depth_path = depth_dir / f"{frame_id:06d}.npy"
+            io_futures.append(executor.submit(np.save, str(depth_path), depth.copy()))
 
         agent_state = sim.get_agent_state()
         trajectory_positions.append(agent_state.position.copy())
@@ -791,42 +746,24 @@ while clip_id <= NUM_CLIPS:
             observations = env.step(action)
             steps_taken += 1
 
-            # 记录移动后的帧
+            # 记录移动后的帧（使用异步 IO 加速）
             if "rgb" in observations:
                 rgb = observations["rgb"]
                 if rgb.shape[2] == 4:
                     rgb = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
                 elif rgb.shape[2] == 3:
                     rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                try:
-                    rgb_path = rgb_dir / f"{frame_id:06d}.png"
-                    success = cv2.imwrite(str(rgb_path), rgb)
-                    if not success:
-                        raise IOError(f"cv2.imwrite returned False for frame {frame_id}")
-                except Exception as rgb_error:
-                    failed_frame_count += 1
-                    allowed_failures = max(2, int(0.05 * (frame_id + 1)))
-                    max_failed_frames = max(max_failed_frames, allowed_failures)
-                    if failed_frame_count > allowed_failures:
-                        clip_failed = True
-                        failure_reason = f"Exceeded failed frame tolerance"
-                        failure_stage = "trajectory"
-                        break
+                # 🚀 异步保存 RGB（JPEG 格式，质量 95%，速度更快）
+                rgb_path = rgb_dir / f"{frame_id:06d}.jpg"
+                io_futures.append(executor.submit(cv2.imwrite, str(rgb_path), rgb.copy(), [cv2.IMWRITE_JPEG_QUALITY, 95]))
 
             if "depth" in observations:
                 depth = observations["depth"]
                 depth_images.append(depth.copy())
-                try:
-                    depth_path = depth_dir / f"{frame_id:06d}.npy"
-                    np.save(str(depth_path), depth)
-                except Exception as depth_error:
-                    failed_frame_count += 1
-                    allowed_failures = max(2, int(0.05 * (frame_id + 1)))
-                    if failed_frame_count > allowed_failures:
-                        clip_failed = True
-                        failure_reason = f"Exceeded failed frame tolerance"
-                        failure_stage = "trajectory"
-                        break
+                # 🚀 异步保存 depth
+                depth_path = depth_dir / f"{frame_id:06d}.npy"
+                depth_copy = depth.copy()
+                io_futures.append(executor.submit(np.save, str(depth_path), depth_copy))
 
             if clip_failed:
                 break
@@ -1015,6 +952,14 @@ while clip_id <= NUM_CLIPS:
         stats["total_actions"] += len(actions_2d)
         stats["scenes"][scene_name] = stats["scenes"].get(scene_name, 0) + 1
 
+        # 🆕 记录已采集的 episode_id，避免同次运行中重复
+        collected_episode_ids.add(str(episode.episode_id))
+
+        # 🚀 等待当前 clip 的 IO 完成，然后清理 futures
+        if len(io_futures) > 100:
+            concurrent.futures.wait(io_futures)
+            io_futures.clear()
+
         collected.append(meta)
         print(f"✅ Clip {clip_id} done: {frame_id} frames, {len(actions_2d)} actions")
 
@@ -1041,6 +986,13 @@ while clip_id <= NUM_CLIPS:
                 "next_clip_to_try": clip_id,
                 "next_episode_attempt": episode_attempt
             }, f)
+
+# 🚀 等待所有异步 IO 完成
+if io_futures:
+    print(f"⏳ Waiting for {len(io_futures)} pending IO operations...")
+    concurrent.futures.wait(io_futures)
+    io_futures.clear()
+    print("✅ All IO completed")
 
 env.close()
 
