@@ -713,7 +713,7 @@ while clip_id <= NUM_CLIPS:
             depth_images.append(depth.copy())
             # 🚀 异步保存 depth
             depth_path = depth_dir / f"{frame_id:06d}.npy"
-            io_futures.append(executor.submit(np.save, str(depth_path), depth.copy()))
+            io_futures.append(executor.submit(np.save, str(depth_path), depth.copy().astype(np.float16)))  # float16 节省空间
 
         agent_state = sim.get_agent_state()
         trajectory_positions.append(agent_state.position.copy())
@@ -763,7 +763,7 @@ while clip_id <= NUM_CLIPS:
                 # 🚀 异步保存 depth
                 depth_path = depth_dir / f"{frame_id:06d}.npy"
                 depth_copy = depth.copy()
-                io_futures.append(executor.submit(np.save, str(depth_path), depth_copy))
+                io_futures.append(executor.submit(np.save, str(depth_path), depth_copy.astype(np.float16)))  # float16 节省空间
 
             if clip_failed:
                 break
