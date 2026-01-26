@@ -54,25 +54,31 @@ def create_full_clip_visualization(
         print(f"  警告: 无法读取俯视图 {clip_path / 'topdown_trajectory.jpg'}")
         return 0
 
-    trajectory_3d = np.load(str(clip_path / "trajectory_3d.npy"))
-
-    # 计算世界坐标到图像的映射
-    x_coords = trajectory_3d[:, 0]
-    z_coords = trajectory_3d[:, 2]
-    padding = 5.0
-    x_min, x_max = x_coords.min() - padding, x_coords.max() + padding
-    z_min, z_max = z_coords.min() - padding, z_coords.max() + padding
-
-    map_h, map_w = navmesh_img.shape[:2]
-    view_range = max(x_max - x_min, z_max - z_min)
-    x_center = (x_min + x_max) / 2
-    z_center = (z_min + z_max) / 2
-
-    def world_to_pixel(x: float, z: float) -> tuple:
-        """世界坐标转像素坐标"""
-        px = int((x - (x_center - view_range / 2)) / view_range * map_w)
-        py = int((z - (z_center - view_range / 2)) / view_range * map_h)
-        return max(0, min(map_w - 1, px)), max(0, min(map_h - 1, py))
+    # 加载坐标转换信息（像素坐标已预计算）
+    transform_path = clip_path / "topdown_transform.json"
+    if transform_path.exists():
+        with open(transform_path, "r") as f:
+            transform = json.load(f)
+        trajectory_pixels = transform["trajectory_pixels"]  # 每帧的像素坐标
+    else:
+        # 兼容旧数据：使用简单线性映射（可能不准确）
+        print(f"  警告: 未找到 topdown_transform.json，使用近似坐标")
+        trajectory_3d = np.load(str(clip_path / "trajectory_3d.npy"))
+        x_coords = trajectory_3d[:, 0]
+        z_coords = trajectory_3d[:, 2]
+        padding = 5.0
+        x_min, x_max = x_coords.min() - padding, x_coords.max() + padding
+        z_min, z_max = z_coords.min() - padding, z_coords.max() + padding
+        map_h, map_w = navmesh_img.shape[:2]
+        view_range = max(x_max - x_min, z_max - z_min)
+        x_center = (x_min + x_max) / 2
+        z_center = (z_min + z_max) / 2
+        trajectory_pixels = []
+        for i in range(len(trajectory_3d)):
+            x, z = trajectory_3d[i, 0], trajectory_3d[i, 2]
+            px = int((x - (x_center - view_range / 2)) / view_range * map_w)
+            py = int((z - (z_center - view_range / 2)) / view_range * map_h)
+            trajectory_pixels.append([max(0, min(map_w - 1, px)), max(0, min(map_h - 1, py))])
 
     # 采样帧
     frames_to_process = list(range(0, num_frames, sample_interval))
@@ -84,23 +90,28 @@ def create_full_clip_visualization(
         # 1. 俯视图 + 轨迹
         topdown = navmesh_img.copy()
 
-        # 绘制过去轨迹（蓝色）
-        for i in range(min(frame_idx, len(trajectory_3d) - 1)):
-            p1 = world_to_pixel(trajectory_3d[i, 0], trajectory_3d[i, 2])
-            p2 = world_to_pixel(trajectory_3d[i + 1, 0], trajectory_3d[i + 1, 2])
+        # 绘制过去轨迹（蓝色）- 使用预计算的像素坐标
+        for i in range(min(frame_idx, len(trajectory_pixels) - 1)):
+            p1 = tuple(trajectory_pixels[i])
+            p2 = tuple(trajectory_pixels[i + 1])
             cv2.line(topdown, p1, p2, (255, 150, 0), 2)
 
         # 当前位置（红色圆点 + 朝向箭头）
-        if frame_idx < len(trajectory_3d):
-            curr = world_to_pixel(trajectory_3d[frame_idx, 0], trajectory_3d[frame_idx, 2])
+        if frame_idx < len(trajectory_pixels):
+            curr = tuple(trajectory_pixels[frame_idx])
             cv2.circle(topdown, curr, 8, (0, 0, 255), -1)
 
-            # 相机朝向
-            pose = np.array(poses[frame_idx])
-            forward = -pose[:3, 2]
-            fwd_end = trajectory_3d[frame_idx] + forward * 1.5
-            fwd_px = world_to_pixel(fwd_end[0], fwd_end[2])
-            cv2.arrowedLine(topdown, curr, fwd_px, (0, 0, 200), 2, tipLength=0.3)
+            # 相机朝向：使用下一帧位置作为朝向参考
+            if frame_idx + 1 < len(trajectory_pixels):
+                next_pt = tuple(trajectory_pixels[frame_idx + 1])
+                # 计算方向向量
+                dx = next_pt[0] - curr[0]
+                dy = next_pt[1] - curr[1]
+                length = max(1, (dx**2 + dy**2)**0.5)
+                # 归一化并延长
+                arrow_len = 20
+                fwd_px = (int(curr[0] + dx / length * arrow_len), int(curr[1] + dy / length * arrow_len))
+                cv2.arrowedLine(topdown, curr, fwd_px, (0, 0, 200), 2, tipLength=0.3)
 
         cv2.putText(
             topdown,

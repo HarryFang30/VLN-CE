@@ -241,7 +241,7 @@ def generate_topdown_trajectory_map(
     current_frame: Optional[int] = None,
     output_size: int = 512,
     padding_meters: float = 5.0
-) -> np.ndarray:
+) -> Tuple[np.ndarray, Dict]:
     """
     生成上帝视角（俯视图）的轨迹图，使用导航网格作为背景
     
@@ -379,7 +379,18 @@ def generate_topdown_trajectory_map(
     cv2.putText(color_map, f"{scale_meters:.0f}m", (scale_x + scale_pixels + 5, scale_y + 5),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     
-    return color_map
+    # 计算所有轨迹点的像素坐标（用于可视化脚本）
+    trajectory_pixels = [world_to_pixel(p) for p in trajectory_3d]
+    waypoints_pixels = [world_to_pixel(wp) for wp in waypoints]
+    
+    # 返回坐标转换信息
+    transform_info = {
+        "trajectory_pixels": trajectory_pixels,  # 每帧在俯视图中的像素坐标
+        "waypoints_pixels": waypoints_pixels,    # 每个waypoint的像素坐标
+        "output_size": output_size,
+    }
+    
+    return color_map, transform_info
 
 
 # ==================== 辅助函数 ====================
@@ -915,8 +926,9 @@ def main():
             np.save(clip_dir / "trajectory_3d.npy", trajectory_3d_arr)
             
             # 生成并保存上帝视角轨迹图（带真实场景纹理）
+            topdown_transform = None
             try:
-                topdown_map = generate_topdown_trajectory_map(
+                topdown_map, topdown_transform = generate_topdown_trajectory_map(
                     sim,
                     trajectory_3d_arr,
                     waypoints,
@@ -929,6 +941,10 @@ def main():
                     cv2.imwrite, str(topdown_path), topdown_map,
                     [cv2.IMWRITE_JPEG_QUALITY, 90]
                 ))
+                
+                # 保存坐标转换信息（用于可视化脚本）
+                with open(clip_dir / "topdown_transform.json", "w") as f:
+                    json.dump(topdown_transform, f)
             except Exception as e:
                 print(f"    ⚠️  上帝视角图生成失败: {e}")
             
