@@ -12,17 +12,19 @@ SIMULATOR:
   RGB_SENSOR:
     WIDTH: 640
     HEIGHT: 480
-    SENSOR_SUBTYPE: EQUIRECTANGULAR
+    HFOV: 90
+    SENSOR_SUBTYPE: PINHOLE
     POSITION: [0, 1.25, 0]
-    TYPE: HabitatSimEquirectangularRGBSensor
+    TYPE: HabitatSimRGBSensor
   DEPTH_SENSOR:
     WIDTH: 640
     HEIGHT: 480
-    SENSOR_SUBTYPE: EQUIRECTANGULAR
+    HFOV: 90
+    SENSOR_SUBTYPE: PINHOLE
     MIN_DEPTH: 0.0
     MAX_DEPTH: 10.0
     POSITION: [0, 1.25, 0]
-    TYPE: HabitatSimEquirectangularDepthSensor
+    TYPE: HabitatSimDepthSensor
 TASK:
   TYPE: VLN-v0
   SUCCESS_DISTANCE: 3.0

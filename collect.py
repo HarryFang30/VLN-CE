@@ -174,32 +174,63 @@ def get_sensor_extrinsics(config) -> np.ndarray:
 
 
 def compute_intrinsics(config) -> Dict:
-    """计算Equirectangular传感器的基础参数"""
+    """计算传感器的内参（支持 Pinhole 和 Equirectangular）"""
     rgb_cfg = config.SIMULATOR.RGB_SENSOR
     width = int(rgb_cfg.WIDTH)
     height = int(rgb_cfg.HEIGHT)
     subtype = getattr(rgb_cfg, "SENSOR_SUBTYPE", "PINHOLE")
     subtype_str = str(subtype).upper()
-    if "EQUIRECT" not in subtype_str:
-        raise ValueError(
-            "collect.py 现在要求 RGB_SENSOR.SENSOR_SUBTYPE 为 EQUIRECTANGULAR，"
-            f" 当前值为 {subtype}"
-        )
+    
+    if "EQUIRECT" in subtype_str:
+        # Equirectangular 全景图模式
+        horizontal_fov = float(getattr(rgb_cfg, "HFOV", 360.0))
+        vertical_fov = 180.0
+        pixels_per_rad_h = width / (2.0 * math.pi)
+        pixels_per_rad_v = height / math.pi
 
-    horizontal_fov = float(getattr(rgb_cfg, "HFOV", 360.0))
-    vertical_fov = 180.0
-    pixels_per_rad_h = width / (2.0 * math.pi)
-    pixels_per_rad_v = height / math.pi
-
-    return {
-        "projection": "equirectangular",
-        "width": width,
-        "height": height,
-        "hfov": horizontal_fov,
-        "vfov": vertical_fov,
-        "pixels_per_radian_horizontal": pixels_per_rad_h,
-        "pixels_per_radian_vertical": pixels_per_rad_v
-    }
+        return {
+            "projection": "equirectangular",
+            "width": width,
+            "height": height,
+            "hfov": horizontal_fov,
+            "vfov": vertical_fov,
+            "pixels_per_radian_horizontal": pixels_per_rad_h,
+            "pixels_per_radian_vertical": pixels_per_rad_v
+        }
+    else:
+        # Pinhole 标准相机模式
+        hfov_deg = float(getattr(rgb_cfg, "HFOV", 90.0))
+        hfov_rad = math.radians(hfov_deg)
+        
+        # 计算焦距 (fx = width / (2 * tan(hfov/2)))
+        fx = width / (2.0 * math.tan(hfov_rad / 2.0))
+        fy = fx  # 假设像素为正方形
+        
+        # 光心位于图像中心
+        cx = width / 2.0
+        cy = height / 2.0
+        
+        # 计算垂直视场角
+        vfov_rad = 2.0 * math.atan(height / (2.0 * fy))
+        vfov_deg = math.degrees(vfov_rad)
+        
+        return {
+            "projection": "pinhole",
+            "width": width,
+            "height": height,
+            "hfov": hfov_deg,
+            "vfov": vfov_deg,
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
+            # 内参矩阵 K
+            "K": [
+                [fx, 0.0, cx],
+                [0.0, fy, cy],
+                [0.0, 0.0, 1.0]
+            ]
+        }
 
 
 def project_point_equirect(p_cam: np.ndarray, width: int, height: int) -> Tuple[float, float]:
@@ -871,8 +902,25 @@ while clip_id <= NUM_CLIPS:
             img_width, img_height = w_obs, h_obs
             intrinsics_data["width"] = w_obs
             intrinsics_data["height"] = h_obs
-            intrinsics_data["pixels_per_radian_horizontal"] = w_obs / (2.0 * math.pi)
-            intrinsics_data["pixels_per_radian_vertical"] = h_obs / math.pi
+            
+            if intrinsics_data["projection"] == "equirectangular":
+                # Equirectangular 模式：更新每弧度像素数
+                intrinsics_data["pixels_per_radian_horizontal"] = w_obs / (2.0 * math.pi)
+                intrinsics_data["pixels_per_radian_vertical"] = h_obs / math.pi
+            else:
+                # Pinhole 模式：根据新尺寸重新计算内参
+                hfov_rad = math.radians(intrinsics_data["hfov"])
+                fx = w_obs / (2.0 * math.tan(hfov_rad / 2.0))
+                fy = fx
+                cx = w_obs / 2.0
+                cy = h_obs / 2.0
+                vfov_rad = 2.0 * math.atan(h_obs / (2.0 * fy))
+                intrinsics_data["fx"] = fx
+                intrinsics_data["fy"] = fy
+                intrinsics_data["cx"] = cx
+                intrinsics_data["cy"] = cy
+                intrinsics_data["vfov"] = math.degrees(vfov_rad)
+                intrinsics_data["K"] = [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]]
         
         print(f"  ✅ Collected {total_frames} frames (热力图将在训练时动态计算)")
 
@@ -882,17 +930,34 @@ while clip_id <= NUM_CLIPS:
             json.dump(poses, f, indent=2)
 
         # 2. 保存内参
-        intrinsics_out = {
-            "projection": "equirectangular",
-            "width": int(img_width),
-            "height": int(img_height),
-            "hfov": float(intrinsics_data["hfov"]),
-            "vfov": float(intrinsics_data["vfov"]),
-            "pixels_per_radian": {
-                "horizontal": float(intrinsics_data["pixels_per_radian_horizontal"]),
-                "vertical": float(intrinsics_data["pixels_per_radian_vertical"])
+        projection_type = intrinsics_data["projection"]
+        if projection_type == "pinhole":
+            # Pinhole 模式：保存标准相机内参
+            intrinsics_out = {
+                "projection": "pinhole",
+                "width": int(img_width),
+                "height": int(img_height),
+                "hfov": float(intrinsics_data["hfov"]),
+                "vfov": float(intrinsics_data["vfov"]),
+                "fx": float(intrinsics_data["fx"]),
+                "fy": float(intrinsics_data["fy"]),
+                "cx": float(intrinsics_data["cx"]),
+                "cy": float(intrinsics_data["cy"]),
+                "K": intrinsics_data["K"]
             }
-        }
+        else:
+            # Equirectangular 模式
+            intrinsics_out = {
+                "projection": "equirectangular",
+                "width": int(img_width),
+                "height": int(img_height),
+                "hfov": float(intrinsics_data["hfov"]),
+                "vfov": float(intrinsics_data["vfov"]),
+                "pixels_per_radian": {
+                    "horizontal": float(intrinsics_data["pixels_per_radian_horizontal"]),
+                    "vertical": float(intrinsics_data["pixels_per_radian_vertical"])
+                }
+            }
         with open(clip_dir / "intrinsics.json", "w") as f:
             json.dump(intrinsics_out, f, indent=2)
 
