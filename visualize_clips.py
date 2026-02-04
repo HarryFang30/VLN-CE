@@ -66,11 +66,22 @@ def generate_history_heatmap(
     depth_image: Optional[np.ndarray] = None,
     occlusion_margin: float = 0.5,
     max_visible_distance: float = 15.0,
+    # 新增参数：与训练逻辑一致
+    use_max_merge: bool = True,           # 使用 max 合并（避免累加饱和）
+    use_distance_decay: bool = True,      # 启用距离衰减
+    distance_decay_ref: float = 5.0,      # 距离衰减参考值（米）
+    min_peak_value: float = 0.3,          # 最远处的最小峰值
 ) -> np.ndarray:
     """
     生成热力图：标记当前视野中历史帧相机位置的投影
     
-    与 HeatmapVLN 训练时使用的逻辑一致
+    设计原则（便于模型学习）：
+    1. 使用 max 合并而非累加，避免重叠区域饱和
+    2. 峰值随距离衰减，体现"近处更重要"
+    3. 增大 min_sigma，让远处的点也清晰可见
+    4. 值范围 [0, 1]，不依赖历史帧数量
+    
+    与 HeatmapVLN 训练时使用的逻辑完全一致
     """
     heatmap = np.zeros((height, width), dtype=np.float32)
     
@@ -128,10 +139,26 @@ def generate_history_heatmap(
             if observed_depth > 0 and observed_depth < z_depth - occlusion_margin:
                 continue  # 被遮挡
         
-        # 计算自适应 sigma
+        # 计算自适应 sigma（与训练时一致的相对比例）
+        # 训练时：在 64x64 热力图上，sigma 范围 1.5-6.0（增大了 min_sigma）
+        # 可视化时：需要按比例放大到原图尺寸
+        hm_width = 64  # 训练时热力图宽度
+        scale = width / hm_width  # 缩放因子 = 640/64 = 10
+        
         object_size_3d = 0.5
-        projected_size = object_size_3d * fx / max(z_depth, 0.1)
-        sigma = max(2.0, min(projected_size / 3.0, 15.0))
+        # 先在热力图尺寸下计算
+        fx_hm = fx / scale  # 等效焦距
+        projected_size_hm = object_size_3d * fx_hm / max(z_depth, 0.1)
+        sigma_hm = max(1.5, min(projected_size_hm / 3.0, 6.0))  # min_sigma 从 0.8 增加到 1.5
+        # 转换到原图尺寸
+        sigma = sigma_hm * scale
+        
+        # 计算距离衰减的峰值
+        if use_distance_decay:
+            decay_factor = 1.0 / (1.0 + distance / distance_decay_ref)
+            peak_value = min_peak_value + (1.0 - min_peak_value) * decay_factor
+        else:
+            peak_value = 1.0
         
         # 绘制高斯点
         u_int, v_int = int(u), int(v)
@@ -149,12 +176,20 @@ def generate_history_heatmap(
             np.arange(x_min, x_max) - u_int,
             indexing='ij'
         )
-        gaussian = np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
-        heatmap[y_min:y_max, x_min:x_max] += gaussian.astype(np.float32)
+        gaussian = peak_value * np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        
+        if use_max_merge:
+            # Max 合并：避免重叠区域饱和
+            heatmap[y_min:y_max, x_min:x_max] = np.maximum(
+                heatmap[y_min:y_max, x_min:x_max],
+                gaussian.astype(np.float32)
+            )
+        else:
+            # 累加模式（旧版本）
+            heatmap[y_min:y_max, x_min:x_max] += gaussian.astype(np.float32)
     
-    # 归一化
-    if heatmap.max() > 0:
-        heatmap = heatmap / heatmap.max()
+    # 不再做全局归一化，保持值范围 [0, 1]
+    # 热力图值有明确的物理意义：表示"这个位置的历史帧有多近/多重要"
     
     return heatmap
 
