@@ -5,20 +5,158 @@
 为每个clip的每一帧创建完整可视化，包含：
 - Top-Down: 导航网格 + 过去轨迹 + 当前位置箭头
 - RGB: 当前第一视角图像
-- Heatmap: 热力图（显示覆盖率百分比）
+- Heatmap: 热力图（动态生成，显示覆盖率百分比）
 - Overlay: RGB + 热力图叠加
 
 用法:
     python visualize_clips.py --input /path/to/patrol_data --output /path/to/output
     python visualize_clips.py --input /path/to/patrol_data --output /path/to/output --interval 3
+    python visualize_clips.py --input /path/to/patrol_data --output /path/to/output --random 10
 """
 
 import argparse
 import json
+import random
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
+
+
+# ==================== 热力图动态生成函数 (历史帧相机位置) ====================
+
+def project_point_pinhole(
+    p_cam: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int
+):
+    """
+    将相机坐标系下的3D点投影到Pinhole图像坐标
+    
+    Habitat 相机坐标系：X 右，Y 上，-Z 前
+    因此相机前方是 z < 0
+    """
+    x, y, z = float(p_cam[0]), float(p_cam[1]), float(p_cam[2])
+    
+    # 相机前方是 -Z 方向，所以 z < 0 才是在相机前方
+    if z >= -0.1:
+        return None
+    
+    z_depth = -z
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+    
+    u = fx * x / z_depth + cx
+    v = fy * (-y) / z_depth + cy  # Y 轴翻转
+    
+    if not (0 <= u < width and 0 <= v < height):
+        return None
+    
+    return float(u), float(v), float(z_depth)
+
+
+def generate_history_heatmap(
+    history_poses: list,
+    current_pose: np.ndarray,
+    K: np.ndarray,
+    width: int,
+    height: int,
+    depth_image: Optional[np.ndarray] = None,
+    occlusion_margin: float = 0.5,
+    max_visible_distance: float = 15.0,
+) -> np.ndarray:
+    """
+    生成热力图：标记当前视野中历史帧相机位置的投影
+    
+    与 HeatmapVLN 训练时使用的逻辑一致
+    """
+    heatmap = np.zeros((height, width), dtype=np.float32)
+    
+    if len(history_poses) == 0:
+        return heatmap
+    
+    # 当前帧位姿的逆
+    T_current = np.array(current_pose, dtype=np.float32)
+    T_current_inv = np.linalg.inv(T_current)
+    
+    # 处理深度图
+    depth_plane = None
+    if depth_image is not None:
+        if len(depth_image.shape) == 3:
+            depth_plane = depth_image[:, :, 0]
+        else:
+            depth_plane = depth_image
+    
+    fx = K[0, 0]
+    
+    for hist_pose in history_poses:
+        T_hist = np.array(hist_pose, dtype=np.float32)
+        
+        # 历史帧相机中心（世界坐标系）
+        hist_center_world = np.array([
+            T_hist[0, 3], T_hist[1, 3], T_hist[2, 3], 1.0
+        ], dtype=np.float32)
+        
+        # 转换到当前帧相机坐标系
+        p_cam = T_current_inv @ hist_center_world
+        
+        # 计算距离
+        distance = float(np.linalg.norm(p_cam[:3]))
+        if distance < 1e-4 or distance > max_visible_distance:
+            continue
+        
+        # 投影到图像坐标 (Pinhole)
+        projection = project_point_pinhole(p_cam, K, width, height)
+        if projection is None:
+            continue
+        u, v, z_depth = projection
+        
+        # 遮挡检测
+        if depth_plane is not None:
+            depth_h, depth_w = depth_plane.shape
+            u_d = u * (depth_w / width)
+            v_d = v * (depth_h / height)
+            u_int = int(np.clip(u_d, 0, depth_w - 1))
+            v_int = int(np.clip(v_d, 0, depth_h - 1))
+            observed_depth = float(depth_plane[v_int, u_int])
+            
+            # 深度归一化转换
+            observed_depth = observed_depth * 10.0  # Habitat 默认 max_depth=10
+            
+            if observed_depth > 0 and observed_depth < z_depth - occlusion_margin:
+                continue  # 被遮挡
+        
+        # 计算自适应 sigma
+        object_size_3d = 0.5
+        projected_size = object_size_3d * fx / max(z_depth, 0.1)
+        sigma = max(2.0, min(projected_size / 3.0, 15.0))
+        
+        # 绘制高斯点
+        u_int, v_int = int(u), int(v)
+        radius = int(3 * sigma)
+        y_min = max(0, v_int - radius)
+        y_max = min(height, v_int + radius + 1)
+        x_min = max(0, u_int - radius)
+        x_max = min(width, u_int + radius + 1)
+        
+        if y_min >= y_max or x_min >= x_max:
+            continue
+        
+        yy, xx = np.meshgrid(
+            np.arange(y_min, y_max) - v_int,
+            np.arange(x_min, x_max) - u_int,
+            indexing='ij'
+        )
+        gaussian = np.exp(-(xx**2 + yy**2) / (2 * sigma**2))
+        heatmap[y_min:y_max, x_min:x_max] += gaussian.astype(np.float32)
+    
+    # 归一化
+    if heatmap.max() > 0:
+        heatmap = heatmap / heatmap.max()
+    
+    return heatmap
 
 
 def create_full_clip_visualization(
@@ -27,7 +165,7 @@ def create_full_clip_visualization(
     sample_interval: int = 5,
     frames_per_page: int = 8,
 ) -> int:
-    """为clip的每一帧创建完整可视化
+    """为clip的每一帧创建完整可视化（动态生成热力图）
 
     Args:
         clip_path: clip数据目录路径
@@ -45,6 +183,16 @@ def create_full_clip_visualization(
         poses = json.load(f)
     with open(clip_path / "meta.json", "r") as f:
         meta = json.load(f)
+    with open(clip_path / "intrinsics.json", "r") as f:
+        intrinsics = json.load(f)
+    
+    # 相机内参
+    K = np.array(intrinsics["K"], dtype=np.float32)
+    img_width = intrinsics["width"]
+    img_height = intrinsics["height"]
+    
+    # 将 poses 转换为 numpy 数组
+    poses_np = [np.array(p, dtype=np.float32) for p in poses]
 
     num_frames = len(poses)
 
@@ -134,14 +282,36 @@ def create_full_clip_visualization(
             continue
         rgb = cv2.resize(rgb, (320, 240))
 
-        # 3. 热力图
-        hm_path = clip_path / "heatmaps" / f"{frame_idx:06d}.npy"
-        hm = np.load(str(hm_path))
+        # 3. 动态生成热力图（历史帧相机位置）
+        if frame_idx > 0 and frame_idx < len(poses_np):
+            # 获取当前相机位姿
+            current_pose = poses_np[frame_idx]
+            # 历史帧的位姿
+            history_poses = poses_np[:frame_idx]
+            
+            # 加载深度图用于遮挡检测
+            depth_path = clip_path / "depth" / f"{frame_idx:06d}.npy"
+            depth_image = None
+            if depth_path.exists():
+                depth_image = np.load(str(depth_path)).astype(np.float32)
+            
+            # 生成热力图（与训练时逻辑一致）
+            hm = generate_history_heatmap(
+                history_poses, current_pose, K,
+                img_width, img_height,
+                depth_image=depth_image,
+                occlusion_margin=0.5,
+                max_visible_distance=15.0
+            )
+        else:
+            # 第一帧没有历史帧
+            hm = np.zeros((img_height, img_width), dtype=np.float32)
+        
         hm_color = cv2.applyColorMap((hm * 255).astype(np.uint8), cv2.COLORMAP_JET)
         hm_color = cv2.resize(hm_color, (320, 240))
 
         # 覆盖率标注
-        cov = np.count_nonzero(hm) / hm.size * 100
+        cov = np.count_nonzero(hm > 0.01) / hm.size * 100  # 使用阈值避免噪声
         cv2.putText(
             hm_color,
             f"{cov:.1f}%",
@@ -255,6 +425,18 @@ def main():
         default=None,
         help="只处理指定的clip（格式: scene_name/clip_xxx）",
     )
+    parser.add_argument(
+        "--random",
+        type=int,
+        default=None,
+        help="随机选取指定数量的clips进行可视化",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="随机种子（默认42）",
+    )
 
     args = parser.parse_args()
 
@@ -277,6 +459,12 @@ def main():
         clips = [clip_path]
     else:
         clips = find_all_clips(data_dir)
+        
+        # 随机选取
+        if args.random and args.random < len(clips):
+            random.seed(args.seed)
+            clips = random.sample(clips, args.random)
+            print(f"随机选取 {args.random} 个 clips (seed={args.seed})")
 
     if len(clips) == 0:
         print("未找到任何clip目录")

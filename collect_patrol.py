@@ -12,11 +12,12 @@
 数据格式：
 - rgb/: RGB 图像 (JPG)
 - depth/: 深度图 (NPY, float16)
-- heatmaps/: 热力图 Ground Truth (NPY, float16) - 标记当前视野中过去走过的位置
 - poses.json: 相机位姿 (4x4 变换矩阵)
 - trajectory_3d.npy: 3D 轨迹点 [T, 3]
 - intrinsics.json: 相机内参
 - meta.json: 元数据
+
+注意：热力图 (heatmaps) 在训练时动态生成，不预先保存以节省磁盘空间
 """
 import habitat
 import cv2
@@ -667,8 +668,6 @@ def parse_args():
                         help='巡逻点之间的最大距离（米）')
     parser.add_argument('--max-steps', type=int, default=500,
                         help='每个 clip 的最大步数')
-    parser.add_argument('--heatmap-sigma', type=float, default=15.0,
-                        help='热力图高斯核大小（像素）')
     parser.add_argument('--num-workers', type=int, default=16,
                         help='IO worker 数量')
     parser.add_argument('--gpu', type=int, default=0,
@@ -691,8 +690,8 @@ def main():
     print(f"   每个 clip 巡逻点: {args.num_waypoints}")
     print(f"   巡逻点距离: {args.min_waypoint_dist}m ~ {args.max_waypoint_dist}m")
     print(f"   最大步数: {args.max_steps}")
-    print(f"   热力图 sigma: {args.heatmap_sigma}")
     print(f"   返回起点: {args.return_to_start}")
+    print(f"   💾 热力图: 不保存 (训练时动态生成)")
     print(f"   ✅ 路径可达性检查: 已启用")
     print("="*60)
     
@@ -745,7 +744,6 @@ def main():
         "successful": 0,
         "failed": 0,
         "total_frames": 0,
-        "total_heatmap_coverage": 0.0,  # 平均热力图覆盖率
         "scenes": {}
     }
     
@@ -754,7 +752,24 @@ def main():
     io_futures = []
     
     start_time = time.time()
-    clip_id = 1
+    
+    # 断点续采：扫描现有 clips 找到最大 clip_id
+    existing_clips = list(output_root.glob("*/clip_*/meta.json"))
+    if existing_clips:
+        max_existing_id = 0
+        for meta_path in existing_clips:
+            clip_name = meta_path.parent.name  # e.g., "clip_001234"
+            try:
+                clip_num = int(clip_name.split("_")[1])
+                max_existing_id = max(max_existing_id, clip_num)
+            except (ValueError, IndexError):
+                pass
+        clip_id = max_existing_id + 1
+        print(f"📂 断点续采: 发现 {len(existing_clips)} 个已完成 clips，从 clip_{clip_id:06d} 继续")
+    else:
+        clip_id = 1
+        print(f"📂 全新采集: 从 clip_{clip_id:06d} 开始")
+    
     scene_list = list(scenes.keys())
     random.shuffle(scene_list)
     scene_idx = 0
@@ -810,16 +825,13 @@ def main():
             clip_dir = output_root / scene_name / f"clip_{clip_id:06d}"
             rgb_dir = clip_dir / "rgb"
             depth_dir = clip_dir / "depth"
-            heatmap_dir = clip_dir / "heatmaps"
             rgb_dir.mkdir(parents=True, exist_ok=True)
             depth_dir.mkdir(parents=True, exist_ok=True)
-            heatmap_dir.mkdir(parents=True, exist_ok=True)
             
             # 数据存储
             poses = []
             trajectory_3d = []  # 3D 轨迹点
             frame_id = 0
-            total_heatmap_sum = 0.0
             
             # 遍历巡逻路径
             for target_idx, target_point in enumerate(patrol_path[1:], 1):
@@ -867,30 +879,6 @@ def main():
                     # 4. 记录 3D 位置
                     trajectory_3d.append(current_pos.copy())
                     
-                    # 5. 生成热力图 Ground Truth（带遮挡检测）
-                    if len(trajectory_3d) > 1:
-                        # 使用之前走过的所有位置
-                        past_positions = np.array(trajectory_3d[:-1], dtype=np.float32)
-                        # 获取当前深度图用于遮挡检测
-                        current_depth = observations.get("depth", None)
-                        heatmap = generate_visited_heatmap(
-                            past_positions, T_w_c, K, 
-                            img_width, img_height,
-                            depth_image=current_depth,  # 传入深度图进行遮挡检测
-                            sigma=args.heatmap_sigma,
-                            occlusion_margin=0.5  # 0.5米的容差（处理深度噪声）
-                        )
-                        total_heatmap_sum += heatmap.mean()
-                    else:
-                        # 第一帧没有过去位置
-                        heatmap = np.zeros((img_height, img_width), dtype=np.float32)
-                    
-                    # 保存热力图
-                    heatmap_path = heatmap_dir / f"{frame_id:06d}.npy"
-                    io_futures.append(executor.submit(
-                        np.save, str(heatmap_path), heatmap.astype(np.float16)
-                    ))
-                    
                     frame_id += 1
                     
                     # 获取下一个动作
@@ -915,7 +903,6 @@ def main():
                 continue
             
             # 保存元数据
-            avg_heatmap_coverage = total_heatmap_sum / max(1, frame_id - 1)
             
             # 保存 poses
             with open(clip_dir / "poses.json", "w") as f:
@@ -963,12 +950,9 @@ def main():
                 "num_waypoints": len(waypoints),
                 "waypoints": waypoints_list,
                 "return_to_start": args.return_to_start,
-                "avg_heatmap_coverage": float(avg_heatmap_coverage),
-                "heatmap_sigma": args.heatmap_sigma,
                 "data_format": {
                     "rgb": "JPG images in rgb/ folder",
                     "depth": "NPY float16 in depth/ folder",
-                    "heatmaps": "NPY float16 in heatmaps/ folder, [H,W] range [0,1]",
                     "poses": "4x4 camera-to-world transforms in poses.json",
                     "trajectory_3d": "NPY float32 [T,3] world positions",
                     "topdown_trajectory": "JPG bird's eye view trajectory map"
@@ -981,10 +965,9 @@ def main():
             # 更新统计
             stats["successful"] += 1
             stats["total_frames"] += frame_id
-            stats["total_heatmap_coverage"] += avg_heatmap_coverage
             stats["scenes"][scene_name] = stats["scenes"].get(scene_name, 0) + 1
             
-            print(f"  ✅ 完成: {frame_id} 帧, 热力图覆盖率: {avg_heatmap_coverage:.3f}")
+            print(f"  ✅ 完成: {frame_id} 帧")
             
             # 清理 IO futures
             if len(io_futures) > 100:
@@ -1018,9 +1001,6 @@ def main():
     print(f"✅ 成功: {stats['successful']}/{args.num_clips}")
     print(f"❌ 失败: {stats['failed']}")
     print(f"📊 总帧数: {stats['total_frames']}")
-    if stats['successful'] > 0:
-        avg_coverage = stats['total_heatmap_coverage'] / stats['successful']
-        print(f"🔥 平均热力图覆盖率: {avg_coverage:.3f}")
     print(f"⏱️  耗时: {elapsed:.1f}s ({elapsed/60:.1f} min)")
     print(f"🏠 场景分布: {len(stats['scenes'])} 个场景")
     
