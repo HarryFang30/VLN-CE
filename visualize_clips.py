@@ -318,11 +318,24 @@ def create_full_clip_visualization(
         rgb = cv2.resize(rgb, (320, 240))
 
         # 3. 动态生成热力图（历史帧相机位置）
+        # 与训练时一致：采样 num_history_sample 帧历史
+        num_history_sample = 32  # 与训练配置一致
+        
         if frame_idx > 0 and frame_idx < len(poses_np):
             # 获取当前相机位姿
             current_pose = poses_np[frame_idx]
-            # 历史帧的位姿
-            history_poses = poses_np[:frame_idx]
+            # 历史帧的位姿（全部）
+            all_history_poses = poses_np[:frame_idx]
+            
+            # 采样历史帧（与训练时逻辑一致）
+            num_available = len(all_history_poses)
+            if num_available <= num_history_sample:
+                # 历史帧不足，全部使用
+                history_poses = list(all_history_poses)
+            else:
+                # 均匀采样 num_history_sample 帧
+                indices = np.linspace(0, num_available - 1, num_history_sample, dtype=int)
+                history_poses = [all_history_poses[i] for i in indices]
             
             # 加载深度图用于遮挡检测
             depth_path = clip_path / "depth" / f"{frame_idx:06d}.npy"
