@@ -18,7 +18,8 @@ This toolkit provides scripts for collecting expert navigation trajectories with
 
 ```
 VLN-CE/
-├── collect_heatmap.py       # Main data collection script
+├── collect.py               # R2R VLN data collection (with instructions)
+├── collect_heatmap.py       # Patrol data collection (for heatmap training)
 ├── visualize_clips.py       # Visualization tool for collected data
 ├── analyze.py               # Data quality analysis
 ├── habitat_extensions/      # Habitat-Sim extensions
@@ -30,6 +31,45 @@ VLN-CE/
 │   └── scene_datasets/
 │       └── mp3d/
 └── README.md
+```
+
+## Data Collection Scripts
+
+This toolkit provides **two collection scripts** for different purposes:
+
+| Script | Purpose | Output | Has Instructions |
+|--------|---------|--------|------------------|
+| `collect.py` | R2R VLN navigation data | `r2r_train_data/` | Yes |
+| `collect_heatmap.py` | Patrol data for heatmap training | `heatmap_train_data/` | No |
+
+### collect.py (R2R VLN Data)
+
+Collects navigation trajectories from R2R VLN-CE episodes with:
+- Natural language instructions
+- Reference path and keyframe matching
+- Discrete and continuous actions
+
+```bash
+python collect.py \
+  --output /root/autodl-tmp/r2r_train_data \
+  --split train \
+  --num-clips 2000 \
+  --gpu 0
+```
+
+### collect_heatmap.py (Patrol Data)
+
+Collects random patrol trajectories for heatmap head training:
+- No instructions (empty string)
+- Random waypoint navigation within scenes
+- Used for pre-training heatmap prediction
+
+```bash
+python collect_heatmap.py \
+  --output /root/autodl-tmp/heatmap_train_data \
+  --split train \
+  --num-clips 2000 \
+  --gpu 0
 ```
 
 ## Quick Start
@@ -84,26 +124,29 @@ nohup python collect_heatmap.py --output /path/to/output --split train --num-cli
 ## Output Data Format
 
 ```
-/path/to/output_dataset/
-├── <scene_name>/
-│   └── clip_XXXXXX/
-│       ├── rgb/                    # RGB images (JPEG, 640×480)
-│       │   ├── 000000.jpg
-│       │   └── ...
-│       ├── depth/                  # Depth maps (float16 NPY, 640×480)
-│       │   ├── 000000.npy
-│       │   └── ...
-│       ├── poses.json              # Camera poses [T, 4, 4] (T_world_camera)
-│       ├── intrinsics.json         # Camera intrinsics (Pinhole)
-│       ├── actions.npy             # Continuous actions [T, 2] (dx, dy)
-│       ├── discrete_actions.npy    # Discrete actions [T] (0-3)
-│       ├── meta.json               # Episode metadata
-│       ├── topdown_trajectory.jpg  # Top-down visualization
-│       ├── topdown_transform.json  # Top-down map transform
-│       └── trajectory_3d.npy       # 3D trajectory points
-├── train/                          # Symlink for train split
-├── val/                            # Symlink for val split
-└── split_info.json                 # Train/val scene split info
+/root/autodl-tmp/r2r_train_data/          # or heatmap_train_data/
+├── logs/                                  # Collection logs
+│   └── collect_train_YYYYMMDD_HHMMSS.log
+├── collection_stats.json                  # Collection statistics
+├── split_info.json                        # Train/val scene split
+├── train/                                 # Symlink for train split
+├── val/                                   # Symlink for val split
+└── <scene_name>/
+    └── clip_XXXXXX/
+        ├── rgb/                           # RGB images (JPEG, 640×480)
+        │   ├── 000000.jpg
+        │   └── ...
+        ├── depth/                         # Depth maps (float16 NPY, 640×480)
+        │   ├── 000000.npy
+        │   └── ...
+        ├── poses.json                     # Camera poses [T, 4, 4] (T_world_camera)
+        ├── intrinsics.json                # Camera intrinsics (Pinhole)
+        ├── actions.npy                    # Continuous actions [T, 2] (dx, dy)
+        ├── discrete_actions.npy           # Discrete actions [T] (0-3)
+        ├── meta.json                      # Episode metadata
+        ├── topdown_trajectory.jpg         # Top-down visualization
+        ├── topdown_transform.json         # Top-down map transform
+        └── trajectory_3d.npy              # 3D trajectory points
 ```
 
 ### Data Fields

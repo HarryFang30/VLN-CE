@@ -9,9 +9,9 @@
 - Overlay: RGB + 热力图叠加
 
 用法:
-    python visualize_clips.py --input /path/to/patrol_data --output /path/to/output
-    python visualize_clips.py --input /path/to/patrol_data --output /path/to/output --interval 3
-    python visualize_clips.py --input /path/to/patrol_data --output /path/to/output --random 10
+    python visualize_clips.py --input /path/to/heatmap_train_data --output /path/to/output
+    python visualize_clips.py --input /path/to/heatmap_train_data --output /path/to/output --interval 8
+    python visualize_clips.py --input /path/to/heatmap_train_data --output /path/to/output --random 10
 """
 
 import argparse
@@ -439,8 +439,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-    python visualize_clips.py --input /root/autodl-tmp/patrol_data --output /root/autodl-tmp/vis
-    python visualize_clips.py --input /root/autodl-tmp/patrol_data --output /root/autodl-tmp/vis --interval 3 --frames-per-page 6
+    python visualize_clips.py --input /root/autodl-tmp/heatmap_train_data --output visualize
+    python visualize_clips.py --input /root/autodl-tmp/heatmap_train_data --output visualize --interval 8 --random 10
         """,
     )
     parser.add_argument(

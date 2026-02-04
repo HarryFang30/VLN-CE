@@ -656,7 +656,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="多点往返巡逻数据采集")
     parser.add_argument('--config', type=str, default="habitat_extensions/config/vlnce_collect.yaml",
                         help='Habitat 配置文件路径')
-    parser.add_argument('--output', type=str, default="/root/autodl-tmp/patrol_dataset",
+    parser.add_argument('--output', type=str, default="/root/autodl-tmp/heatmap_train_data",
                         help='输出目录')
     parser.add_argument('--num-clips', type=int, default=1000,
                         help='采集的 clip 数量')

@@ -174,81 +174,44 @@ def get_sensor_extrinsics(config) -> np.ndarray:
 
 
 def compute_intrinsics(config) -> Dict:
-    """计算传感器的内参（支持 Pinhole 和 Equirectangular）"""
+    """计算 Pinhole 相机内参"""
     rgb_cfg = config.SIMULATOR.RGB_SENSOR
     width = int(rgb_cfg.WIDTH)
     height = int(rgb_cfg.HEIGHT)
-    subtype = getattr(rgb_cfg, "SENSOR_SUBTYPE", "PINHOLE")
-    subtype_str = str(subtype).upper()
     
-    if "EQUIRECT" in subtype_str:
-        # Equirectangular 全景图模式
-        horizontal_fov = float(getattr(rgb_cfg, "HFOV", 360.0))
-        vertical_fov = 180.0
-        pixels_per_rad_h = width / (2.0 * math.pi)
-        pixels_per_rad_v = height / math.pi
-
-        return {
-            "projection": "equirectangular",
-            "width": width,
-            "height": height,
-            "hfov": horizontal_fov,
-            "vfov": vertical_fov,
-            "pixels_per_radian_horizontal": pixels_per_rad_h,
-            "pixels_per_radian_vertical": pixels_per_rad_v
-        }
-    else:
-        # Pinhole 标准相机模式
-        hfov_deg = float(getattr(rgb_cfg, "HFOV", 90.0))
-        hfov_rad = math.radians(hfov_deg)
-        
-        # 计算焦距 (fx = width / (2 * tan(hfov/2)))
-        fx = width / (2.0 * math.tan(hfov_rad / 2.0))
-        fy = fx  # 假设像素为正方形
-        
-        # 光心位于图像中心
-        cx = width / 2.0
-        cy = height / 2.0
-        
-        # 计算垂直视场角
-        vfov_rad = 2.0 * math.atan(height / (2.0 * fy))
-        vfov_deg = math.degrees(vfov_rad)
-        
-        return {
-            "projection": "pinhole",
-            "width": width,
-            "height": height,
-            "hfov": hfov_deg,
-            "vfov": vfov_deg,
-            "fx": fx,
-            "fy": fy,
-            "cx": cx,
-            "cy": cy,
-            # 内参矩阵 K
-            "K": [
-                [fx, 0.0, cx],
-                [0.0, fy, cy],
-                [0.0, 0.0, 1.0]
-            ]
-        }
-
-
-def project_point_equirect(p_cam: np.ndarray, width: int, height: int) -> Tuple[float, float]:
-    """将相机坐标系下的3D点投影到Equirectangular图像坐标"""
-    x, y, z = float(p_cam[0]), float(p_cam[1]), float(p_cam[2])
-    r = math.sqrt(x * x + y * y + z * z)
-    if r < 1e-6:
-        return None
-
-    phi = math.atan2(x, -z)
-    theta = math.asin(np.clip(y / r, -1.0, 1.0))
-
-    u = (phi + math.pi) / (2.0 * math.pi) * width
-    v = (0.5 - (theta / math.pi)) * height
-
-    u = u % width
-    v = np.clip(v, 0.0, height - 1e-6)
-    return float(u), float(v)
+    # Pinhole 标准相机模式
+    hfov_deg = float(getattr(rgb_cfg, "HFOV", 90.0))
+    hfov_rad = math.radians(hfov_deg)
+    
+    # 计算焦距 (fx = width / (2 * tan(hfov/2)))
+    fx = width / (2.0 * math.tan(hfov_rad / 2.0))
+    fy = fx  # 假设像素为正方形
+    
+    # 光心位于图像中心
+    cx = width / 2.0
+    cy = height / 2.0
+    
+    # 计算垂直视场角
+    vfov_rad = 2.0 * math.atan(height / (2.0 * fy))
+    vfov_deg = math.degrees(vfov_rad)
+    
+    return {
+        "projection": "pinhole",
+        "width": width,
+        "height": height,
+        "hfov": hfov_deg,
+        "vfov": vfov_deg,
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        # 内参矩阵 K
+        "K": [
+            [fx, 0.0, cx],
+            [0.0, fy, cy],
+            [0.0, 0.0, 1.0]
+        ]
+    }
 
 
 def compute_camera_pose(agent_state, T_agent_cam: np.ndarray) -> np.ndarray:
@@ -406,25 +369,6 @@ def compute_adaptive_min_valid_ratio(
     return float(threshold), quality_tier
 
 
-def compute_adaptive_sigma(
-    distance: float,
-    object_size_3d: float = 0.3,
-    heatmap_width: int = 64,
-    min_sigma: float = 0.5,
-    max_sigma: float = 5.0
-) -> float:
-    """计算Equirectangular坐标系下的自适应sigma"""
-    if distance <= 1e-4:
-        return float(max_sigma)
-
-    angular_radius = math.atan2(object_size_3d, distance)
-    pixels_per_rad = heatmap_width / (2.0 * math.pi)
-    projected_radius_heatmap = angular_radius * pixels_per_rad
-    sigma = projected_radius_heatmap / 3.0
-    sigma = np.clip(sigma, min_sigma, max_sigma)
-    return float(sigma)
-
-
 # ==================== 命令行参数 ====================
 import argparse
 
@@ -432,7 +376,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="VLN-CE 数据采集脚本（包含动作）")
     parser.add_argument('--config', type=str, default="habitat_extensions/config/vlnce_collect.yaml",
                         help='Habitat 配置文件路径')
-    parser.add_argument('--output', type=str, default="/root/autodl-tmp/dataset_with_actions",
+    parser.add_argument('--output', type=str, default="/root/autodl-tmp/r2r_train_data",
                         help='输出目录')
     parser.add_argument('--split', type=str, default="train", choices=['train', 'val', 'val_seen', 'val_unseen', 'test'],
                         help='数据集划分')
@@ -456,6 +400,40 @@ SPLIT = args.split
 NUM_CLIPS = args.num_clips
 MAX_STEPS = args.max_steps
 NUM_WORKERS = args.num_workers
+
+# ==================== 日志配置 ====================
+import sys
+from datetime import datetime
+
+# 创建输出目录和日志目录
+output_root_path = Path(OUTPUT_ROOT)
+output_root_path.mkdir(parents=True, exist_ok=True)
+logs_dir = output_root_path / "logs"
+logs_dir.mkdir(parents=True, exist_ok=True)
+
+# 日志文件名：包含时间戳
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+log_file = logs_dir / f"collect_{SPLIT}_{timestamp}.log"
+
+# 创建 Tee 类，同时输出到控制台和文件
+class TeeOutput:
+    def __init__(self, file_path):
+        self.terminal = sys.stdout
+        self.log = open(file_path, "w", encoding="utf-8", buffering=1)
+    
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+    
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+sys.stdout = TeeOutput(log_file)
+sys.stderr = TeeOutput(log_file)
+
+print(f"📝 Logging to: {log_file}")
 
 print(f"🚀 Starting data collection (WITH ACTIONS)")
 print(f"   Output: {OUTPUT_ROOT}")
@@ -903,24 +881,19 @@ while clip_id <= NUM_CLIPS:
             intrinsics_data["width"] = w_obs
             intrinsics_data["height"] = h_obs
             
-            if intrinsics_data["projection"] == "equirectangular":
-                # Equirectangular 模式：更新每弧度像素数
-                intrinsics_data["pixels_per_radian_horizontal"] = w_obs / (2.0 * math.pi)
-                intrinsics_data["pixels_per_radian_vertical"] = h_obs / math.pi
-            else:
-                # Pinhole 模式：根据新尺寸重新计算内参
-                hfov_rad = math.radians(intrinsics_data["hfov"])
-                fx = w_obs / (2.0 * math.tan(hfov_rad / 2.0))
-                fy = fx
-                cx = w_obs / 2.0
-                cy = h_obs / 2.0
-                vfov_rad = 2.0 * math.atan(h_obs / (2.0 * fy))
-                intrinsics_data["fx"] = fx
-                intrinsics_data["fy"] = fy
-                intrinsics_data["cx"] = cx
-                intrinsics_data["cy"] = cy
-                intrinsics_data["vfov"] = math.degrees(vfov_rad)
-                intrinsics_data["K"] = [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]]
+            # Pinhole 模式：根据新尺寸重新计算内参
+            hfov_rad = math.radians(intrinsics_data["hfov"])
+            fx = w_obs / (2.0 * math.tan(hfov_rad / 2.0))
+            fy = fx
+            cx = w_obs / 2.0
+            cy = h_obs / 2.0
+            vfov_rad = 2.0 * math.atan(h_obs / (2.0 * fy))
+            intrinsics_data["fx"] = fx
+            intrinsics_data["fy"] = fy
+            intrinsics_data["cx"] = cx
+            intrinsics_data["cy"] = cy
+            intrinsics_data["vfov"] = math.degrees(vfov_rad)
+            intrinsics_data["K"] = [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]]
         
         print(f"  ✅ Collected {total_frames} frames (热力图将在训练时动态计算)")
 
@@ -929,35 +902,19 @@ while clip_id <= NUM_CLIPS:
         with open(clip_dir / "poses.json", "w") as f:
             json.dump(poses, f, indent=2)
 
-        # 2. 保存内参
-        projection_type = intrinsics_data["projection"]
-        if projection_type == "pinhole":
-            # Pinhole 模式：保存标准相机内参
-            intrinsics_out = {
-                "projection": "pinhole",
-                "width": int(img_width),
-                "height": int(img_height),
-                "hfov": float(intrinsics_data["hfov"]),
-                "vfov": float(intrinsics_data["vfov"]),
-                "fx": float(intrinsics_data["fx"]),
-                "fy": float(intrinsics_data["fy"]),
-                "cx": float(intrinsics_data["cx"]),
-                "cy": float(intrinsics_data["cy"]),
-                "K": intrinsics_data["K"]
-            }
-        else:
-            # Equirectangular 模式
-            intrinsics_out = {
-                "projection": "equirectangular",
-                "width": int(img_width),
-                "height": int(img_height),
-                "hfov": float(intrinsics_data["hfov"]),
-                "vfov": float(intrinsics_data["vfov"]),
-                "pixels_per_radian": {
-                    "horizontal": float(intrinsics_data["pixels_per_radian_horizontal"]),
-                    "vertical": float(intrinsics_data["pixels_per_radian_vertical"])
-                }
-            }
+        # 2. 保存内参 (Pinhole)
+        intrinsics_out = {
+            "projection": "pinhole",
+            "width": int(img_width),
+            "height": int(img_height),
+            "hfov": float(intrinsics_data["hfov"]),
+            "vfov": float(intrinsics_data["vfov"]),
+            "fx": float(intrinsics_data["fx"]),
+            "fy": float(intrinsics_data["fy"]),
+            "cx": float(intrinsics_data["cx"]),
+            "cy": float(intrinsics_data["cy"]),
+            "K": intrinsics_data["K"]
+        }
         with open(clip_dir / "intrinsics.json", "w") as f:
             json.dump(intrinsics_out, f, indent=2)
 
