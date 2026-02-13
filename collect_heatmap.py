@@ -10,9 +10,9 @@
 3. 当从后续点返回时，视野中会大量包含之前走过的位置
 
 数据格式：
-- rgb/: RGB 图像 (JPG)
-- depth/: 深度图 (NPY, float16)
-- poses.json: 相机位姿 (4x4 变换矩阵)
+- rgb/{front,right,back,left}/: 四个方向的 RGB 图像 (JPG)
+- depth/{front,right,back,left}/: 四个方向的深度图 (NPY, float16)
+- poses.json: 相机位姿，每帧包含 4 个方向的 4x4 变换矩阵
 - trajectory_3d.npy: 3D 轨迹点 [T, 3]
 - intrinsics.json: 相机内参
 - meta.json: 元数据
@@ -27,7 +27,9 @@ import math
 import time
 import random
 import shutil
+import quaternion as _quaternion  # numpy-quaternion，用于四元数旋转
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, List, Tuple, Optional
 import concurrent.futures
 import habitat_extensions
@@ -35,6 +37,17 @@ from habitat_extensions.config.default import get_extended_config
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.sims.habitat_simulator.actions import HabitatSimActions
 from habitat.utils.visualizations import maps as habitat_maps
+
+
+# ==================== 多方向采集配置 ====================
+
+DIRECTIONS = ["front", "right", "back", "left"]
+DIRECTION_YAW_OFFSETS = {
+    "front": 0.0,
+    "right": -np.pi / 2,   # 顺时针 90°（向右看）
+    "back": np.pi,          # 180°（向后看）
+    "left": np.pi / 2,      # 逆时针 90°（向左看）
+}
 
 
 # ==================== 核心函数：热力图生成 ====================
@@ -474,6 +487,74 @@ def get_sensor_extrinsics(config) -> np.ndarray:
     return T_agent_cam
 
 
+def capture_multiview(sim, T_agent_cam: np.ndarray) -> Dict:
+    """
+    在当前位置采集前后左右四个方向的 RGB、Depth 图像和相机位姿
+    
+    通过临时旋转 Agent 朝向来采集不同方向的观测，采集完成后恢复原始状态。
+    
+    Args:
+        sim: Habitat 仿真器
+        T_agent_cam: 传感器外参矩阵 [4, 4]
+    
+    Returns:
+        dict: {direction: {"rgb": ndarray, "depth": ndarray, "pose": ndarray[4,4]}}
+              direction ∈ ["front", "right", "back", "left"]
+    """
+    agent_state = sim.get_agent_state()
+    original_position = agent_state.position.copy()
+    original_rotation = agent_state.rotation
+    
+    # 确保原始旋转是 np.quaternion 类型
+    if not isinstance(original_rotation, np.quaternion):
+        if hasattr(original_rotation, 'scalar') and hasattr(original_rotation, 'vector'):
+            original_rotation = np.quaternion(
+                original_rotation.scalar,
+                original_rotation.vector.x,
+                original_rotation.vector.y,
+                original_rotation.vector.z
+            )
+        elif hasattr(original_rotation, 'w'):
+            original_rotation = np.quaternion(
+                original_rotation.w, original_rotation.x,
+                original_rotation.y, original_rotation.z
+            )
+    
+    results = {}
+    
+    for direction in DIRECTIONS:
+        yaw = DIRECTION_YAW_OFFSETS[direction]
+        
+        if abs(yaw) < 1e-6:
+            # Front: 使用原始朝向
+            rotated_rotation = original_rotation
+        else:
+            # 创建绕 Y 轴旋转的四元数，并与原始朝向复合
+            q_yaw = np.quaternion(np.cos(yaw / 2), 0, np.sin(yaw / 2), 0)
+            rotated_rotation = original_rotation * q_yaw
+        
+        # 设置旋转后的 Agent 状态
+        sim.set_agent_state(original_position, rotated_rotation)
+        
+        # 获取传感器观测
+        obs = sim.get_sensor_observations()
+        
+        # 计算该方向的相机位姿
+        fake_state = SimpleNamespace(position=original_position, rotation=rotated_rotation)
+        pose = compute_camera_pose(fake_state, T_agent_cam)
+        
+        results[direction] = {
+            "rgb": obs["rgb"].copy(),
+            "depth": obs["depth"].copy(),
+            "pose": pose,
+        }
+    
+    # 恢复原始 Agent 状态（确保后续路径跟随不受影响）
+    sim.set_agent_state(original_position, original_rotation)
+    
+    return results
+
+
 def compute_camera_pose(agent_state, T_agent_cam: np.ndarray) -> np.ndarray:
     """计算相机到世界的变换矩阵"""
     agent_position = agent_state.position
@@ -825,8 +906,9 @@ def main():
             clip_dir = output_root / scene_name / f"clip_{clip_id:06d}"
             rgb_dir = clip_dir / "rgb"
             depth_dir = clip_dir / "depth"
-            rgb_dir.mkdir(parents=True, exist_ok=True)
-            depth_dir.mkdir(parents=True, exist_ok=True)
+            for direction in DIRECTIONS:
+                (rgb_dir / direction).mkdir(parents=True, exist_ok=True)
+                (depth_dir / direction).mkdir(parents=True, exist_ok=True)
             
             # 数据存储
             poses = []
@@ -850,33 +932,38 @@ def main():
                     if dist_to_target < 0.5:
                         break
                     
-                    # 记录当前帧
-                    # 1. 保存 RGB
-                    if "rgb" in observations:
-                        rgb = observations["rgb"]
+                    # 记录当前帧（前后左右四个方向）
+                    multiview = capture_multiview(sim, T_agent_cam)
+                    
+                    frame_poses = {}
+                    for direction in DIRECTIONS:
+                        obs_d = multiview[direction]
+                        
+                        # 1. 保存 RGB
+                        rgb = obs_d["rgb"]
                         if rgb.shape[2] == 4:
                             rgb = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
                         elif rgb.shape[2] == 3:
                             rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                        rgb_path = rgb_dir / f"{frame_id:06d}.jpg"
+                        rgb_path = rgb_dir / direction / f"{frame_id:06d}.jpg"
                         io_futures.append(executor.submit(
                             cv2.imwrite, str(rgb_path), rgb.copy(), 
                             [cv2.IMWRITE_JPEG_QUALITY, 95]
                         ))
-                    
-                    # 2. 保存 Depth
-                    if "depth" in observations:
-                        depth = observations["depth"]
-                        depth_path = depth_dir / f"{frame_id:06d}.npy"
+                        
+                        # 2. 保存 Depth
+                        depth = obs_d["depth"]
+                        depth_path = depth_dir / direction / f"{frame_id:06d}.npy"
                         io_futures.append(executor.submit(
                             np.save, str(depth_path), depth.copy().astype(np.float16)
                         ))
+                        
+                        # 3. 记录该方向的相机位姿
+                        frame_poses[direction] = obs_d["pose"].tolist()
                     
-                    # 3. 计算相机位姿
-                    T_w_c = compute_camera_pose(agent_state, T_agent_cam)
-                    poses.append(T_w_c.tolist())
+                    poses.append(frame_poses)
                     
-                    # 4. 记录 3D 位置
+                    # 4. 记录 3D 位置（Agent 地面位置，与方向无关）
                     trajectory_3d.append(current_pos.copy())
                     
                     frame_id += 1
@@ -951,11 +1038,12 @@ def main():
                 "waypoints": waypoints_list,
                 "return_to_start": args.return_to_start,
                 "data_format": {
-                    "rgb": "JPG images in rgb/ folder",
-                    "depth": "NPY float16 in depth/ folder",
-                    "poses": "4x4 camera-to-world transforms in poses.json",
+                    "rgb": "JPG images in rgb/{front,right,back,left}/ folders (4 views per frame)",
+                    "depth": "NPY float16 in depth/{front,right,back,left}/ folders (4 views per frame)",
+                    "poses": "Per-frame dict with 4 directions, each a 4x4 camera-to-world transform",
                     "trajectory_3d": "NPY float32 [T,3] world positions",
-                    "topdown_trajectory": "JPG bird's eye view trajectory map"
+                    "topdown_trajectory": "JPG bird's eye view trajectory map",
+                    "directions": DIRECTIONS
                 }
             }
             
