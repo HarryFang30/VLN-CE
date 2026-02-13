@@ -50,6 +50,40 @@ DIRECTION_YAW_OFFSETS = {
 }
 
 
+# ==================== IO 调度辅助 ====================
+
+def submit_io_task(
+    executor: concurrent.futures.ThreadPoolExecutor,
+    io_futures: List[concurrent.futures.Future],
+    max_pending: int,
+    fn,
+    *args,
+):
+    """提交异步 IO 任务，并在队列过深时回收已完成任务。"""
+    io_futures.append(executor.submit(fn, *args))
+    if len(io_futures) >= max_pending:
+        _, not_done = concurrent.futures.wait(
+            io_futures, return_when=concurrent.futures.FIRST_COMPLETED
+        )
+        io_futures[:] = list(not_done)
+
+
+def save_chunk_npz(
+    chunk_path: str,
+    frame_ids: np.ndarray,
+    rgb_by_direction: Dict[str, np.ndarray],
+    depth_by_direction: Dict[str, np.ndarray],
+    pose_by_direction: Dict[str, np.ndarray],
+):
+    """将一个时间块内的多视角数据打包写入单个 NPZ 文件。"""
+    chunk_dict = {"frame_ids": frame_ids}
+    for direction in DIRECTIONS:
+        chunk_dict[f"rgb_{direction}"] = rgb_by_direction[direction]
+        chunk_dict[f"depth_{direction}"] = depth_by_direction[direction]
+        chunk_dict[f"pose_{direction}"] = pose_by_direction[direction]
+    np.savez(chunk_path, **chunk_dict)
+
+
 # ==================== 核心函数：热力图生成 ====================
 
 def project_3d_to_2d_pinhole(
@@ -751,6 +785,15 @@ def parse_args():
                         help='每个 clip 的最大步数')
     parser.add_argument('--num-workers', type=int, default=16,
                         help='IO worker 数量')
+    parser.add_argument('--max-pending-io', type=int, default=512,
+                        help='最多排队中的异步 IO 任务数')
+    parser.add_argument('--jpg-quality', type=int, default=90,
+                        help='RGB JPG 压缩质量 (1-100)')
+    parser.add_argument('--storage-format', type=str, default='chunks',
+                        choices=['frames', 'chunks'],
+                        help='存储格式：frames=逐帧小文件，chunks=分块打包 npz')
+    parser.add_argument('--chunk-size', type=int, default=64,
+                        help='chunks 模式下每个块包含的帧数')
     parser.add_argument('--gpu', type=int, default=0,
                         help='GPU 设备 ID')
     parser.add_argument('--return-to-start', action='store_true', default=True,
@@ -772,6 +815,9 @@ def main():
     print(f"   巡逻点距离: {args.min_waypoint_dist}m ~ {args.max_waypoint_dist}m")
     print(f"   最大步数: {args.max_steps}")
     print(f"   返回起点: {args.return_to_start}")
+    print(f"   存储格式: {args.storage_format}")
+    print(f"   JPG质量: {args.jpg_quality}")
+    print(f"   IO并发: workers={args.num_workers}, pending={args.max_pending_io}")
     print(f"   💾 热力图: 不保存 (训练时动态生成)")
     print(f"   ✅ 路径可达性检查: 已启用")
     print("="*60)
@@ -904,16 +950,26 @@ def main():
             
             # 创建输出目录
             clip_dir = output_root / scene_name / f"clip_{clip_id:06d}"
-            rgb_dir = clip_dir / "rgb"
-            depth_dir = clip_dir / "depth"
-            for direction in DIRECTIONS:
-                (rgb_dir / direction).mkdir(parents=True, exist_ok=True)
-                (depth_dir / direction).mkdir(parents=True, exist_ok=True)
+            clip_dir.mkdir(parents=True, exist_ok=True)
+            if args.storage_format == "frames":
+                rgb_dir = clip_dir / "rgb"
+                depth_dir = clip_dir / "depth"
+                for direction in DIRECTIONS:
+                    (rgb_dir / direction).mkdir(parents=True, exist_ok=True)
+                    (depth_dir / direction).mkdir(parents=True, exist_ok=True)
+            else:
+                chunks_dir = clip_dir / "chunks"
+                chunks_dir.mkdir(parents=True, exist_ok=True)
             
             # 数据存储
             poses = []
             trajectory_3d = []  # 3D 轨迹点
             frame_id = 0
+            chunk_id = 0
+            chunk_frame_ids = []
+            chunk_rgb = {direction: [] for direction in DIRECTIONS}
+            chunk_depth = {direction: [] for direction in DIRECTIONS}
+            chunk_pose = {direction: [] for direction in DIRECTIONS}
             
             # 遍历巡逻路径
             for target_idx, target_point in enumerate(patrol_path[1:], 1):
@@ -939,34 +995,86 @@ def main():
                     for direction in DIRECTIONS:
                         obs_d = multiview[direction]
                         
-                        # 1. 保存 RGB
+                        # 1. 处理 RGB
                         rgb = obs_d["rgb"]
                         if rgb.shape[2] == 4:
                             rgb = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
                         elif rgb.shape[2] == 3:
                             rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                        rgb_path = rgb_dir / direction / f"{frame_id:06d}.jpg"
-                        io_futures.append(executor.submit(
-                            cv2.imwrite, str(rgb_path), rgb.copy(), 
-                            [cv2.IMWRITE_JPEG_QUALITY, 95]
-                        ))
                         
-                        # 2. 保存 Depth
+                        # 2. 处理 Depth
                         depth = obs_d["depth"]
-                        depth_path = depth_dir / direction / f"{frame_id:06d}.npy"
-                        io_futures.append(executor.submit(
-                            np.save, str(depth_path), depth.copy().astype(np.float16)
-                        ))
+                        if depth.dtype != np.float16:
+                            depth = depth.astype(np.float16)
                         
-                        # 3. 记录该方向的相机位姿
-                        frame_poses[direction] = obs_d["pose"].tolist()
+                        pose = obs_d["pose"].astype(np.float32)
+                        
+                        if args.storage_format == "frames":
+                            rgb_path = rgb_dir / direction / f"{frame_id:06d}.jpg"
+                            submit_io_task(
+                                executor,
+                                io_futures,
+                                args.max_pending_io,
+                                cv2.imwrite,
+                                str(rgb_path),
+                                rgb,
+                                [cv2.IMWRITE_JPEG_QUALITY, args.jpg_quality],
+                            )
+                            depth_path = depth_dir / direction / f"{frame_id:06d}.npy"
+                            submit_io_task(
+                                executor,
+                                io_futures,
+                                args.max_pending_io,
+                                np.save,
+                                str(depth_path),
+                                depth,
+                            )
+                            frame_poses[direction] = pose.tolist()
+                        else:
+                            chunk_rgb[direction].append(rgb)
+                            chunk_depth[direction].append(depth)
+                            chunk_pose[direction].append(pose)
+                            frame_poses[direction] = pose.tolist()
                     
-                    poses.append(frame_poses)
+                    if args.storage_format == "frames":
+                        poses.append(frame_poses)
                     
                     # 4. 记录 3D 位置（Agent 地面位置，与方向无关）
                     trajectory_3d.append(current_pos.copy())
+                    if args.storage_format == "chunks":
+                        chunk_frame_ids.append(frame_id)
                     
                     frame_id += 1
+                    
+                    if args.storage_format == "chunks" and len(chunk_frame_ids) >= args.chunk_size:
+                        frame_ids_arr = np.array(chunk_frame_ids, dtype=np.int32)
+                        rgb_by_direction = {
+                            d: np.stack(chunk_rgb[d], axis=0).astype(np.uint8, copy=False) for d in DIRECTIONS
+                        }
+                        depth_by_direction = {
+                            d: np.stack(chunk_depth[d], axis=0).astype(np.float16, copy=False) for d in DIRECTIONS
+                        }
+                        pose_by_direction = {
+                            d: np.stack(chunk_pose[d], axis=0).astype(np.float32, copy=False) for d in DIRECTIONS
+                        }
+                        chunk_path = chunks_dir / f"chunk_{chunk_id:05d}.npz"
+                        submit_io_task(
+                            executor,
+                            io_futures,
+                            args.max_pending_io,
+                            save_chunk_npz,
+                            str(chunk_path),
+                            frame_ids_arr,
+                            rgb_by_direction,
+                            depth_by_direction,
+                            pose_by_direction,
+                        )
+                        chunk_id += 1
+                        chunk_frame_ids.clear()
+                        for d in DIRECTIONS:
+                            chunk_rgb[d].clear()
+                            chunk_depth[d].clear()
+                            chunk_pose[d].clear()
                     
                     # 获取下一个动作
                     action = follower.get_next_action(target_point)
@@ -991,9 +1099,40 @@ def main():
             
             # 保存元数据
             
-            # 保存 poses
-            with open(clip_dir / "poses.json", "w") as f:
-                json.dump(poses, f, indent=2)
+            if args.storage_format == "chunks" and len(chunk_frame_ids) > 0:
+                frame_ids_arr = np.array(chunk_frame_ids, dtype=np.int32)
+                rgb_by_direction = {
+                    d: np.stack(chunk_rgb[d], axis=0).astype(np.uint8, copy=False) for d in DIRECTIONS
+                }
+                depth_by_direction = {
+                    d: np.stack(chunk_depth[d], axis=0).astype(np.float16, copy=False) for d in DIRECTIONS
+                }
+                pose_by_direction = {
+                    d: np.stack(chunk_pose[d], axis=0).astype(np.float32, copy=False) for d in DIRECTIONS
+                }
+                chunk_path = chunks_dir / f"chunk_{chunk_id:05d}.npz"
+                submit_io_task(
+                    executor,
+                    io_futures,
+                    args.max_pending_io,
+                    save_chunk_npz,
+                    str(chunk_path),
+                    frame_ids_arr,
+                    rgb_by_direction,
+                    depth_by_direction,
+                    pose_by_direction,
+                )
+                chunk_id += 1
+                chunk_frame_ids.clear()
+                for d in DIRECTIONS:
+                    chunk_rgb[d].clear()
+                    chunk_depth[d].clear()
+                    chunk_pose[d].clear()
+            
+            # 保存 poses（chunks 模式跳过，位姿已随块存储）
+            if args.storage_format == "frames":
+                with open(clip_dir / "poses.json", "w") as f:
+                    json.dump(poses, f, separators=(",", ":"))
             
             # 保存 3D 轨迹
             trajectory_3d_arr = np.array(trajectory_3d, dtype=np.float32)
@@ -1011,20 +1150,25 @@ def main():
                     padding_meters=5.0
                 )
                 topdown_path = clip_dir / "topdown_trajectory.jpg"
-                io_futures.append(executor.submit(
-                    cv2.imwrite, str(topdown_path), topdown_map,
-                    [cv2.IMWRITE_JPEG_QUALITY, 90]
-                ))
+                submit_io_task(
+                    executor,
+                    io_futures,
+                    args.max_pending_io,
+                    cv2.imwrite,
+                    str(topdown_path),
+                    topdown_map,
+                    [cv2.IMWRITE_JPEG_QUALITY, 90],
+                )
                 
                 # 保存坐标转换信息（用于可视化脚本）
                 with open(clip_dir / "topdown_transform.json", "w") as f:
-                    json.dump(topdown_transform, f)
+                    json.dump(topdown_transform, f, separators=(",", ":"))
             except Exception as e:
                 print(f"    ⚠️  上帝视角图生成失败: {e}")
             
             # 保存内参
             with open(clip_dir / "intrinsics.json", "w") as f:
-                json.dump(intrinsics, f, indent=2)
+                json.dump(intrinsics, f, separators=(",", ":"))
             
             # 保存巡逻点
             waypoints_list = [wp.tolist() for wp in waypoints]
@@ -1037,10 +1181,12 @@ def main():
                 "num_waypoints": len(waypoints),
                 "waypoints": waypoints_list,
                 "return_to_start": args.return_to_start,
+                "storage_format": args.storage_format,
                 "data_format": {
-                    "rgb": "JPG images in rgb/{front,right,back,left}/ folders (4 views per frame)",
-                    "depth": "NPY float16 in depth/{front,right,back,left}/ folders (4 views per frame)",
-                    "poses": "Per-frame dict with 4 directions, each a 4x4 camera-to-world transform",
+                    "rgb": "JPG images in rgb/{front,right,back,left}/ folders (4 views per frame) when storage_format=frames",
+                    "depth": "NPY float16 in depth/{front,right,back,left}/ folders (4 views per frame) when storage_format=frames",
+                    "chunks": "NPZ files in chunks/chunk_*.npz, each contains frame_ids and rgb/depth/pose for 4 directions when storage_format=chunks",
+                    "poses": "poses.json only exists when storage_format=frames; chunks mode stores per-view poses in npz",
                     "trajectory_3d": "NPY float32 [T,3] world positions",
                     "topdown_trajectory": "JPG bird's eye view trajectory map",
                     "directions": DIRECTIONS
@@ -1048,7 +1194,7 @@ def main():
             }
             
             with open(clip_dir / "meta.json", "w") as f:
-                json.dump(meta, f, indent=2)
+                json.dump(meta, f, separators=(",", ":"))
             
             # 更新统计
             stats["successful"] += 1
@@ -1056,11 +1202,6 @@ def main():
             stats["scenes"][scene_name] = stats["scenes"].get(scene_name, 0) + 1
             
             print(f"  ✅ 完成: {frame_id} 帧")
-            
-            # 清理 IO futures
-            if len(io_futures) > 100:
-                concurrent.futures.wait(io_futures)
-                io_futures.clear()
             
             clip_id += 1
             
@@ -1094,7 +1235,7 @@ def main():
     
     # 保存统计
     with open(output_root / "collection_stats.json", "w") as f:
-        json.dump(stats, f, indent=2)
+        json.dump(stats, f, separators=(",", ":"))
     
     print(f"\n📝 统计信息已保存到 {output_root / 'collection_stats.json'}")
 

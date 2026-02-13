@@ -8,9 +8,10 @@
 - Heatmap: 前方视角热力图（动态生成，显示覆盖率百分比）
 - Overlay: 前方 RGB + 热力图叠加
 
-支持新旧两种数据格式：
-  - 新格式：rgb/{front,right,back,left}/000000.jpg，poses 为 [{front:..., right:..., back:..., left:...}, ...]
-  - 旧格式：rgb/000000.jpg，poses 为 [矩阵, ...]
+支持三种存储格式（自动检测）：
+  - chunks 格式（默认）：chunks/chunk_*.npz 分块打包，无 poses.json
+  - frames 多视角格式：rgb/{front,right,back,left}/000000.jpg + poses.json
+  - frames 旧单视角格式：rgb/000000.jpg + poses.json
 
 用法:
     python visualize_clips.py --input /path/to/heatmap_train_data --output /path/to/output
@@ -26,6 +27,68 @@ from typing import Optional
 
 import cv2
 import numpy as np
+
+DIRECTIONS = ["front", "right", "back", "left"]
+
+
+# ==================== Chunks 格式数据加载 ====================
+
+def load_all_poses_from_chunks(clip_path: Path):
+    """
+    从 chunks NPZ 中提取所有帧的 front 位姿（用于热力图历史投影）和帧索引映射。
+
+    Returns:
+        frame_to_chunk: dict  {frame_id: (chunk_path_str, local_idx)}
+        poses_np: list[ndarray]  按 frame_id 升序排列的 front 方向 4x4 位姿
+    """
+    chunks_dir = clip_path / "chunks"
+    chunk_files = sorted(chunks_dir.glob("chunk_*.npz"))
+
+    frame_to_chunk = {}
+    all_poses = []  # [(frame_id, pose_front)]
+
+    for cf in chunk_files:
+        data = np.load(str(cf), allow_pickle=False)
+        frame_ids = data["frame_ids"]
+        poses_front = data["pose_front"]
+        for local_idx, fid in enumerate(frame_ids):
+            fid = int(fid)
+            frame_to_chunk[fid] = (str(cf), local_idx)
+            all_poses.append((fid, poses_front[local_idx].astype(np.float32)))
+
+    all_poses.sort(key=lambda x: x[0])
+    poses_np = [p for _, p in all_poses]
+    return frame_to_chunk, poses_np
+
+
+def load_frame_from_chunks(frame_to_chunk: dict, frame_idx: int, chunk_cache: dict):
+    """
+    从 chunks 按需加载指定帧的多视角 RGB / Depth 数据。
+
+    使用 chunk_cache 避免重复 np.load 同一个 chunk 文件。
+
+    Returns:
+        dict  {direction: {"rgb": ndarray[H,W,C], "depth": ndarray[H,W,1]}} 或 None
+    """
+    if frame_idx not in frame_to_chunk:
+        return None
+
+    chunk_path, local_idx = frame_to_chunk[frame_idx]
+
+    # 缓存当前 chunk，避免反复加载同一个文件
+    if chunk_cache.get("_path") != chunk_path:
+        chunk_cache.clear()
+        chunk_cache["_path"] = chunk_path
+        chunk_cache["_data"] = np.load(chunk_path, allow_pickle=False)
+
+    data = chunk_cache["_data"]
+    result = {}
+    for d in DIRECTIONS:
+        result[d] = {
+            "rgb": data[f"rgb_{d}"][local_idx],      # [H,W,C] uint8 BGR
+            "depth": data[f"depth_{d}"][local_idx],   # [H,W,1] float16
+        }
+    return result
 
 
 # ==================== 热力图动态生成函数 (历史帧相机位置) ====================
@@ -217,9 +280,7 @@ def create_full_clip_visualization(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # 加载数据
-    with open(clip_path / "poses.json", "r") as f:
-        poses = json.load(f)
+    # 加载元数据
     with open(clip_path / "meta.json", "r") as f:
         meta = json.load(f)
     with open(clip_path / "intrinsics.json", "r") as f:
@@ -230,19 +291,28 @@ def create_full_clip_visualization(
     img_width = intrinsics["width"]
     img_height = intrinsics["height"]
     
-    # 检测数据格式：新格式（多视角）vs 旧格式（单视角）
-    is_multiview = isinstance(poses[0], dict) and "front" in poses[0]
+    # ---- 检测存储格式：chunks / frames(多视角) / frames(旧单视角) ----
+    storage_format = meta.get("storage_format", "frames")
+    is_chunks = storage_format == "chunks"
     
-    if is_multiview:
-        # 新格式：每帧有 front/right/back/left 四个方向的位姿
-        poses_np = [np.array(p["front"], dtype=np.float32) for p in poses]
-        directions = list(poses[0].keys())  # ["front", "right", "back", "left"]
+    if is_chunks:
+        # chunks 格式：从 NPZ 分块文件加载
+        frame_to_chunk, poses_np = load_all_poses_from_chunks(clip_path)
+        is_multiview = True
+        num_frames = meta["num_frames"]
+        chunk_cache = {}  # 用于按需缓存已加载的 chunk
     else:
-        # 旧格式：每帧一个位姿矩阵
-        poses_np = [np.array(p, dtype=np.float32) for p in poses]
-        directions = None
-
-    num_frames = len(poses)
+        # frames 格式：从 poses.json + 独立文件加载
+        frame_to_chunk = None
+        chunk_cache = None
+        with open(clip_path / "poses.json", "r") as f:
+            poses = json.load(f)
+        is_multiview = isinstance(poses[0], dict) and "front" in poses[0]
+        if is_multiview:
+            poses_np = [np.array(p["front"], dtype=np.float32) for p in poses]
+        else:
+            poses_np = [np.array(p, dtype=np.float32) for p in poses]
+        num_frames = len(poses)
 
     # 读取导航网格俯视图
     navmesh_img = cv2.imread(str(clip_path / "topdown_trajectory.jpg"))
@@ -322,14 +392,25 @@ def create_full_clip_visualization(
         # 缩放俯视图
         topdown = cv2.resize(topdown, (256, 256))
 
-        # 2. 加载 RGB 图像
+        # 2. 加载 RGB 图像（支持 chunks / frames 多视角 / frames 旧格式）
         rgb_size = (256, 192)  # 每张 RGB 的显示尺寸
+        frame_chunk_data = None  # chunks 模式下缓存当前帧数据
         
-        if is_multiview:
-            # 新格式：加载四个方向的 RGB
+        if is_chunks:
+            # ---- chunks 格式 ----
+            frame_chunk_data = load_frame_from_chunks(frame_to_chunk, frame_idx, chunk_cache)
+            if frame_chunk_data is None:
+                print(f"  警告: chunks 中找不到帧 {frame_idx}")
+                continue
+            rgb_views = {}
+            for d in DIRECTIONS:
+                rgb_views[d] = cv2.resize(frame_chunk_data[d]["rgb"], rgb_size)
+            rgb_front = rgb_views["front"]
+        elif is_multiview:
+            # ---- frames 多视角格式 ----
             rgb_views = {}
             skip_frame = False
-            for d in ["front", "right", "back", "left"]:
+            for d in DIRECTIONS:
                 rp = clip_path / "rgb" / d / f"{frame_idx:06d}.jpg"
                 img = cv2.imread(str(rp))
                 if img is None:
@@ -341,7 +422,7 @@ def create_full_clip_visualization(
                 continue
             rgb_front = rgb_views["front"]
         else:
-            # 旧格式：只有一张 RGB
+            # ---- frames 旧单视角格式 ----
             rgb_path = clip_path / "rgb" / f"{frame_idx:06d}.jpg"
             rgb_front = cv2.imread(str(rgb_path))
             if rgb_front is None:
@@ -365,13 +446,14 @@ def create_full_clip_visualization(
                 history_poses = [all_history_poses[i] for i in indices]
             
             # 加载深度图（front 方向）
-            if is_multiview:
+            if is_chunks:
+                depth_image = frame_chunk_data["front"]["depth"].astype(np.float32)
+            elif is_multiview:
                 depth_path = clip_path / "depth" / "front" / f"{frame_idx:06d}.npy"
+                depth_image = np.load(str(depth_path)).astype(np.float32) if depth_path.exists() else None
             else:
                 depth_path = clip_path / "depth" / f"{frame_idx:06d}.npy"
-            depth_image = None
-            if depth_path.exists():
-                depth_image = np.load(str(depth_path)).astype(np.float32)
+                depth_image = np.load(str(depth_path)).astype(np.float32) if depth_path.exists() else None
             
             hm = generate_history_heatmap(
                 history_poses, current_pose, K,
