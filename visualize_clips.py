@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-可视化巡逻数据采集的clips
+可视化巡逻数据采集的clips（多视角版本）
 
 为每个clip的每一帧创建完整可视化，包含：
 - Top-Down: 导航网格 + 过去轨迹 + 当前位置箭头
-- RGB: 当前第一视角图像
-- Heatmap: 热力图（动态生成，显示覆盖率百分比）
-- Overlay: RGB + 热力图叠加
+- Front/Right/Back/Left: 四个方向的第一视角图像
+- Heatmap: 前方视角热力图（动态生成，显示覆盖率百分比）
+- Overlay: 前方 RGB + 热力图叠加
+
+支持新旧两种数据格式：
+  - 新格式：rgb/{front,right,back,left}/000000.jpg，poses 为 [{front:..., right:..., back:..., left:...}, ...]
+  - 旧格式：rgb/000000.jpg，poses 为 [矩阵, ...]
 
 用法:
     python visualize_clips.py --input /path/to/heatmap_train_data --output /path/to/output
@@ -226,8 +230,17 @@ def create_full_clip_visualization(
     img_width = intrinsics["width"]
     img_height = intrinsics["height"]
     
-    # 将 poses 转换为 numpy 数组
-    poses_np = [np.array(p, dtype=np.float32) for p in poses]
+    # 检测数据格式：新格式（多视角）vs 旧格式（单视角）
+    is_multiview = isinstance(poses[0], dict) and "front" in poses[0]
+    
+    if is_multiview:
+        # 新格式：每帧有 front/right/back/left 四个方向的位姿
+        poses_np = [np.array(p["front"], dtype=np.float32) for p in poses]
+        directions = list(poses[0].keys())  # ["front", "right", "back", "left"]
+    else:
+        # 旧格式：每帧一个位姿矩阵
+        poses_np = [np.array(p, dtype=np.float32) for p in poses]
+        directions = None
 
     num_frames = len(poses)
 
@@ -309,41 +322,57 @@ def create_full_clip_visualization(
         # 缩放俯视图
         topdown = cv2.resize(topdown, (256, 256))
 
-        # 2. RGB
-        rgb_path = clip_path / "rgb" / f"{frame_idx:06d}.jpg"
-        rgb = cv2.imread(str(rgb_path))
-        if rgb is None:
-            print(f"  警告: 无法读取 {rgb_path}")
-            continue
-        rgb = cv2.resize(rgb, (320, 240))
+        # 2. 加载 RGB 图像
+        rgb_size = (256, 192)  # 每张 RGB 的显示尺寸
+        
+        if is_multiview:
+            # 新格式：加载四个方向的 RGB
+            rgb_views = {}
+            skip_frame = False
+            for d in ["front", "right", "back", "left"]:
+                rp = clip_path / "rgb" / d / f"{frame_idx:06d}.jpg"
+                img = cv2.imread(str(rp))
+                if img is None:
+                    print(f"  警告: 无法读取 {rp}")
+                    skip_frame = True
+                    break
+                rgb_views[d] = cv2.resize(img, rgb_size)
+            if skip_frame:
+                continue
+            rgb_front = rgb_views["front"]
+        else:
+            # 旧格式：只有一张 RGB
+            rgb_path = clip_path / "rgb" / f"{frame_idx:06d}.jpg"
+            rgb_front = cv2.imread(str(rgb_path))
+            if rgb_front is None:
+                print(f"  警告: 无法读取 {rgb_path}")
+                continue
+            rgb_front = cv2.resize(rgb_front, rgb_size)
+            rgb_views = {"front": rgb_front}
 
-        # 3. 动态生成热力图（历史帧相机位置）
-        # 与训练时一致：采样 num_history_sample 帧历史
-        num_history_sample = 32  # 与训练配置一致
+        # 3. 动态生成热力图（历史帧相机位置，基于 front 视角）
+        num_history_sample = 32
         
         if frame_idx > 0 and frame_idx < len(poses_np):
-            # 获取当前相机位姿
             current_pose = poses_np[frame_idx]
-            # 历史帧的位姿（全部）
             all_history_poses = poses_np[:frame_idx]
             
-            # 采样历史帧（与训练时逻辑一致）
             num_available = len(all_history_poses)
             if num_available <= num_history_sample:
-                # 历史帧不足，全部使用
                 history_poses = list(all_history_poses)
             else:
-                # 均匀采样 num_history_sample 帧
                 indices = np.linspace(0, num_available - 1, num_history_sample, dtype=int)
                 history_poses = [all_history_poses[i] for i in indices]
             
-            # 加载深度图用于遮挡检测
-            depth_path = clip_path / "depth" / f"{frame_idx:06d}.npy"
+            # 加载深度图（front 方向）
+            if is_multiview:
+                depth_path = clip_path / "depth" / "front" / f"{frame_idx:06d}.npy"
+            else:
+                depth_path = clip_path / "depth" / f"{frame_idx:06d}.npy"
             depth_image = None
             if depth_path.exists():
                 depth_image = np.load(str(depth_path)).astype(np.float32)
             
-            # 生成热力图（与训练时逻辑一致）
             hm = generate_history_heatmap(
                 history_poses, current_pose, K,
                 img_width, img_height,
@@ -352,34 +381,39 @@ def create_full_clip_visualization(
                 max_visible_distance=15.0
             )
         else:
-            # 第一帧没有历史帧
             hm = np.zeros((img_height, img_width), dtype=np.float32)
         
         hm_color = cv2.applyColorMap((hm * 255).astype(np.uint8), cv2.COLORMAP_JET)
-        hm_color = cv2.resize(hm_color, (320, 240))
+        hm_color = cv2.resize(hm_color, rgb_size)
 
-        # 覆盖率标注
-        cov = np.count_nonzero(hm > 0.01) / hm.size * 100  # 使用阈值避免噪声
-        cv2.putText(
-            hm_color,
-            f"{cov:.1f}%",
-            (5, 20),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1,
-        )
+        cov = np.count_nonzero(hm > 0.01) / hm.size * 100
+        cv2.putText(hm_color, f"{cov:.1f}%", (5, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-        # 4. 叠加
-        overlay = cv2.addWeighted(rgb, 0.5, hm_color, 0.5, 0)
+        # 4. 叠加（Front RGB + 热力图）
+        overlay = cv2.addWeighted(rgb_front, 0.5, hm_color, 0.5, 0)
 
-        # 拼接：俯视图 | RGB | 热力图 | 叠加
-        # 调整俯视图高度以匹配其他图像
-        topdown_padded = np.ones((240, 256, 3), dtype=np.uint8) * 200
-        topdown_resized = cv2.resize(topdown, (256, 256))[:240, :]
-        topdown_padded[:240, :256] = topdown_resized
+        # 5. 拼接成一行
+        # 俯视图高度匹配
+        topdown_resized = cv2.resize(topdown, (192, 192))
+        topdown_padded = np.ones((rgb_size[1], 192, 3), dtype=np.uint8) * 200
+        topdown_padded[:192, :192] = topdown_resized
 
-        row = np.hstack([topdown_padded, rgb, hm_color, overlay])
+        if is_multiview:
+            # 多视角布局：TopDown | Front | Right | Back | Left | Heatmap | Overlay
+            # 为每张视图添加方向标签
+            for d in ["front", "right", "back", "left"]:
+                cv2.putText(rgb_views[d], d.upper(), (5, 18),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            row = np.hstack([
+                topdown_padded,
+                rgb_views["front"], rgb_views["right"],
+                rgb_views["back"], rgb_views["left"],
+                hm_color, overlay
+            ])
+        else:
+            # 旧格式布局：TopDown | RGB | Heatmap | Overlay
+            row = np.hstack([topdown_padded, rgb_front, hm_color, overlay])
         vis_frames.append(row)
 
     if len(vis_frames) == 0:
@@ -404,8 +438,23 @@ def create_full_clip_visualization(
         # 添加标题行
         title_height = 30
         title = np.ones((title_height, page.shape[1], 3), dtype=np.uint8) * 255
-        labels = ["Top-Down", "RGB", "Heatmap", "Overlay"]
-        x_offsets = [100, 256 + 120, 256 + 320 + 100, 256 + 640 + 100]
+        if is_multiview:
+            labels = ["Top-Down", "Front", "Right", "Back", "Left", "Heatmap", "Overlay"]
+            # 每列宽度: topdown=192, 4*rgb=4*256, heatmap=256, overlay=256
+            col_w = rgb_size[0]  # 256
+            x_offsets = [
+                70,                          # Top-Down (192px wide)
+                192 + col_w * 0 + col_w // 2 - 30,  # Front
+                192 + col_w * 1 + col_w // 2 - 25,  # Right
+                192 + col_w * 2 + col_w // 2 - 25,  # Back
+                192 + col_w * 3 + col_w // 2 - 20,  # Left
+                192 + col_w * 4 + col_w // 2 - 35,  # Heatmap
+                192 + col_w * 5 + col_w // 2 - 35,  # Overlay
+            ]
+        else:
+            labels = ["Top-Down", "RGB", "Heatmap", "Overlay"]
+            col_w = rgb_size[0]
+            x_offsets = [70, 192 + col_w // 2 - 15, 192 + col_w + col_w // 2 - 35, 192 + col_w * 2 + col_w // 2 - 35]
         for label, x in zip(labels, x_offsets):
             cv2.putText(
                 title, label, (x, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2
