@@ -74,11 +74,22 @@ def save_chunk_npz(
     rgb_by_direction: Dict[str, np.ndarray],
     depth_by_direction: Dict[str, np.ndarray],
     pose_by_direction: Dict[str, np.ndarray],
+    jpg_quality: int = 90,
 ):
-    """将一个时间块内的多视角数据打包写入单个 NPZ 文件。"""
+    """将一个时间块内的多视角数据打包写入单个 NPZ 文件。
+
+    RGB 以 JPEG 编码后存为 1-D uint8 字节数组（object array），大幅减小文件体积。
+    存储布局: rgb_{direction} -> object array of shape [N], 每个元素是 np.frombuffer 的 JPEG bytes。
+    """
     chunk_dict = {"frame_ids": frame_ids}
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, jpg_quality]
     for direction in DIRECTIONS:
-        chunk_dict[f"rgb_{direction}"] = rgb_by_direction[direction]
+        rgb_stack = rgb_by_direction[direction]  # [N, H, W, C] uint8 BGR
+        jpg_list = []
+        for i in range(len(rgb_stack)):
+            _, buf = cv2.imencode(".jpg", rgb_stack[i], encode_params)
+            jpg_list.append(buf.astype(np.uint8).ravel())
+        chunk_dict[f"rgb_{direction}"] = np.array(jpg_list, dtype=object)
         chunk_dict[f"depth_{direction}"] = depth_by_direction[direction]
         chunk_dict[f"pose_{direction}"] = pose_by_direction[direction]
     np.savez(chunk_path, **chunk_dict)
@@ -1068,6 +1079,7 @@ def main():
                             rgb_by_direction,
                             depth_by_direction,
                             pose_by_direction,
+                            args.jpg_quality,
                         )
                         chunk_id += 1
                         chunk_frame_ids.clear()
@@ -1121,6 +1133,7 @@ def main():
                     rgb_by_direction,
                     depth_by_direction,
                     pose_by_direction,
+                    args.jpg_quality,
                 )
                 chunk_id += 1
                 chunk_frame_ids.clear()

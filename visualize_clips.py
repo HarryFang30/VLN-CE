@@ -48,7 +48,7 @@ def load_all_poses_from_chunks(clip_path: Path):
     all_poses = []  # [(frame_id, pose_front)]
 
     for cf in chunk_files:
-        data = np.load(str(cf), allow_pickle=False)
+        data = np.load(str(cf), allow_pickle=True)
         frame_ids = data["frame_ids"]
         poses_front = data["pose_front"]
         for local_idx, fid in enumerate(frame_ids):
@@ -66,6 +66,7 @@ def load_frame_from_chunks(frame_to_chunk: dict, frame_idx: int, chunk_cache: di
     从 chunks 按需加载指定帧的多视角 RGB / Depth 数据。
 
     使用 chunk_cache 避免重复 np.load 同一个 chunk 文件。
+    RGB 以 JPEG 编码存储（object array），读取时需解码。
 
     Returns:
         dict  {direction: {"rgb": ndarray[H,W,C], "depth": ndarray[H,W,1]}} 或 None
@@ -75,17 +76,18 @@ def load_frame_from_chunks(frame_to_chunk: dict, frame_idx: int, chunk_cache: di
 
     chunk_path, local_idx = frame_to_chunk[frame_idx]
 
-    # 缓存当前 chunk，避免反复加载同一个文件
     if chunk_cache.get("_path") != chunk_path:
         chunk_cache.clear()
         chunk_cache["_path"] = chunk_path
-        chunk_cache["_data"] = np.load(chunk_path, allow_pickle=False)
+        chunk_cache["_data"] = np.load(chunk_path, allow_pickle=True)
 
     data = chunk_cache["_data"]
     result = {}
     for d in DIRECTIONS:
+        jpg_bytes = data[f"rgb_{d}"][local_idx]
+        rgb = cv2.imdecode(np.frombuffer(jpg_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
         result[d] = {
-            "rgb": data[f"rgb_{d}"][local_idx],      # [H,W,C] uint8 BGR
+            "rgb": rgb,                               # [H,W,C] uint8 BGR
             "depth": data[f"depth_{d}"][local_idx],   # [H,W,1] float16
         }
     return result
