@@ -216,20 +216,28 @@ def generate_visited_heatmap(
     fx = K[0, 0]
     cam_pos = current_pose[:3, 3]
 
-    for uv, z_depth in zip(valid_pixels, valid_z_depths):
+    # 计算有效点到相机的欧氏距离（与训练一致，用于距离衰减）
+    valid_positions = adjusted_positions[valid_mask]
+    valid_distances = np.linalg.norm(valid_positions - cam_pos, axis=1)
+
+    hm_width = 64
+    img_to_hm_scale = hm_width / width
+
+    for uv, z_depth, distance in zip(valid_pixels, valid_z_depths, valid_distances):
         u, v = int(uv[0]), int(uv[1])
 
         if z_depth > max_visible_distance:
             continue
 
-        # 自适应 sigma（与训练逻辑一致）
+        # 自适应 sigma：先在热力图空间(64x64)计算，再缩放到图像空间
         object_size_3d = 0.5
-        projected_size = object_size_3d * fx / max(z_depth, 0.1)
-        adaptive_sigma = np.clip(projected_size / 3.0, 1.5, 15.0)
+        projected_size_hm = object_size_3d * fx / max(z_depth, 0.1) * img_to_hm_scale
+        sigma_hm = np.clip(projected_size_hm / 3.0, 1.5, 6.0)
+        adaptive_sigma = sigma_hm / img_to_hm_scale
 
-        # 距离衰减
+        # 距离衰减（使用欧氏距离，与训练一致）
         if use_distance_decay:
-            decay = 1.0 / (1.0 + z_depth / distance_decay_ref)
+            decay = 1.0 / (1.0 + distance / distance_decay_ref)
             peak_value = min_peak_value + (1.0 - min_peak_value) * decay
         else:
             peak_value = 1.0
