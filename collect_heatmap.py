@@ -161,111 +161,102 @@ def generate_visited_heatmap(
     width: int,
     height: int,
     depth_image: Optional[np.ndarray] = None,  # [H, W] 当前帧深度图，用于遮挡检测
-    sigma: float = 15.0,  # 高斯核大小
     occlusion_margin: float = 0.5,  # 遮挡判断容差（米）
+    max_visible_distance: float = 15.0,
+    use_distance_decay: bool = True,
+    distance_decay_ref: float = 5.0,
+    min_peak_value: float = 0.3,
 ) -> np.ndarray:
     """
     生成热力图：标记当前视野中哪些区域对应过去走过的位置
-    
-    遮挡检测：利用深度图判断是否被墙壁/楼板等物体遮挡
-    - 深度遮挡可以正确处理楼层间遮挡（楼板会阻挡视线）
-    - 楼梯口/挑空区域可以正确看到其他楼层
-    
-    Args:
-        past_positions: 过去走过的 3D 位置（Agent 地面位置）
-        current_pose: 当前相机位姿 [4, 4]
-        K: 相机内参矩阵 [3, 3]
-        width, height: 图像尺寸
-        depth_image: 当前帧深度图，用于遮挡检测
-        sigma: 高斯核大小（用于远处点的上限）
-        occlusion_margin: 遮挡判断容差
-    
+
+    与训练时 (HeatmapVLN) 的 compute_history_heatmap 保持一致：
+    - 使用 max 合并（避免重叠饱和）
+    - 支持距离衰减（近处峰值高，远处低）
+    - 不做全局归一化，保持值域 [0, 1]
+
     Returns:
         heatmap: [H, W] float32，值域 [0, 1]
     """
     heatmap = np.zeros((height, width), dtype=np.float32)
-    
+
     if len(past_positions) == 0:
         return heatmap
-    
-    # 将过去的地面位置调整到相机可见的高度（Agent 眼睛高度约 1.25m）
+
     adjusted_positions = past_positions.copy()
     adjusted_positions[:, 1] += 1.25  # Y 轴向上调整到眼睛高度
-    
-    # 投影到当前视野（同时获取 Z 深度用于遮挡检测）
+
     pixels, valid_mask, z_depths = project_3d_to_2d_pinhole(
         adjusted_positions, current_pose, K, width, height
     )
-    
-    # 深度遮挡检测：利用深度图判断是否被遮挡
-    # 这可以正确处理：墙壁遮挡、楼板遮挡、家具遮挡等
+
+    # 深度遮挡检测
     if depth_image is not None:
-        # 确保深度图是 2D
         if len(depth_image.shape) == 3:
             depth_image = depth_image[:, :, 0]
-        
-        # Habitat 深度图是归一化的 [0, 1]，需要转换回实际米数
+
         max_depth = 10.0
         depth_image_meters = depth_image * max_depth
-        
-        # 对于每个有效投影点，检查是否被遮挡
+
         for i in range(len(pixels)):
             if not valid_mask[i]:
                 continue
-            
             u, v = int(pixels[i, 0]), int(pixels[i, 1])
             if 0 <= u < width and 0 <= v < height:
                 depth_at_pixel = depth_image_meters[v, u]
-                point_z_depth = z_depths[i]
-                
-                # 如果深度图中的深度 < 点的Z深度 - 容差，说明被遮挡
-                if depth_at_pixel > 0 and depth_at_pixel < point_z_depth - occlusion_margin:
+                if depth_at_pixel > 0 and depth_at_pixel < z_depths[i] - occlusion_margin:
                     valid_mask[i] = False
-    
+
     valid_pixels = pixels[valid_mask]
     valid_z_depths = z_depths[valid_mask]
-    
+
     if len(valid_pixels) == 0:
         return heatmap
-    
-    # 获取焦距（用于计算自适应 sigma）
+
     fx = K[0, 0]
-    
-    # 在投影位置绘制高斯斑点（近大远小）
-    for idx, (uv, z_depth) in enumerate(zip(valid_pixels, valid_z_depths)):
+    cam_pos = current_pose[:3, 3]
+
+    for uv, z_depth in zip(valid_pixels, valid_z_depths):
         u, v = int(uv[0]), int(uv[1])
-        
-        # 自适应 sigma：近大远小
-        # 假设一个 0.5m 的物体，投影后的像素大小 = object_size * fx / z_depth
-        object_size_3d = 0.5  # 假设"走过的位置"对应一个 0.5m 的区域
+
+        if z_depth > max_visible_distance:
+            continue
+
+        # 自适应 sigma（与训练逻辑一致）
+        object_size_3d = 0.5
         projected_size = object_size_3d * fx / max(z_depth, 0.1)
-        # sigma 约为投影大小的 1/3
-        adaptive_sigma = max(2.0, min(projected_size / 3.0, sigma))
-        
+        adaptive_sigma = np.clip(projected_size / 3.0, 1.5, 15.0)
+
+        # 距离衰减
+        if use_distance_decay:
+            decay = 1.0 / (1.0 + z_depth / distance_decay_ref)
+            peak_value = min_peak_value + (1.0 - min_peak_value) * decay
+        else:
+            peak_value = 1.0
+
         radius = int(3 * adaptive_sigma)
         y_min = max(0, v - radius)
         y_max = min(height, v + radius + 1)
         x_min = max(0, u - radius)
         x_max = min(width, u + radius + 1)
-        
+
         if y_min >= y_max or x_min >= x_max:
             continue
-        
-        # 创建高斯核
+
         yy, xx = np.meshgrid(
             np.arange(y_min, y_max) - v,
             np.arange(x_min, x_max) - u,
             indexing='ij'
         )
-        gaussian = np.exp(-(xx**2 + yy**2) / (2 * adaptive_sigma**2))
-        
-        # 累加到热力图
-        heatmap[y_min:y_max, x_min:x_max] += gaussian.astype(np.float32)
-    
-    # 归一化到 [0, 1]
-    if heatmap.max() > 0:
-        heatmap = heatmap / heatmap.max()
-    
+        gaussian = peak_value * np.exp(-(xx**2 + yy**2) / (2 * adaptive_sigma**2))
+
+        # Max 合并（与训练一致，避免重叠饱和）
+        np.maximum(
+            heatmap[y_min:y_max, x_min:x_max],
+            gaussian.astype(np.float32),
+            out=heatmap[y_min:y_max, x_min:x_max],
+        )
+
     return heatmap
 
 

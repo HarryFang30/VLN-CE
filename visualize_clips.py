@@ -202,10 +202,11 @@ def generate_history_heatmap(
             v_int = int(np.clip(v_d, 0, depth_h - 1))
             observed_depth = float(depth_plane[v_int, u_int])
             
-            # 深度归一化转换
             observed_depth = observed_depth * 10.0  # Habitat 默认 max_depth=10
             
-            if observed_depth > 0 and observed_depth < z_depth - occlusion_margin:
+            if not np.isfinite(observed_depth) or observed_depth <= 0:
+                continue
+            if observed_depth < z_depth - occlusion_margin:
                 continue  # 被遮挡
         
         # 计算自适应 sigma（与训练时一致的相对比例）
