@@ -5,16 +5,27 @@ R2R-CE 全景数据采集脚本 (Panoramic R2R-CE Collection)
 合并自 collect.py (R2R-CE 导航) 和 collect_heatmap.py (全景采集 + chunks 存储),
 用于同时训练热力图 (System 2) 和轨迹预测 (System 1).
 
+渲染依赖 (GLX + Xvfb):
+  habitat-sim 使用 GLX 渲染, 在无显示器的服务器上需要 Xvfb 虚拟显示:
+    Xvfb :99 -screen 0 1024x768x24 &
+    DISPLAY=:99 python collect_r2r_panoramic.py --gpu 0 ...
+  注意: GLX 仅支持 GPU 0 渲染。若需多 GPU 请重新编译 habitat-sim 启用 EGL (--headless)。
+
 采集策略:
   使用 ShortestPathFollower 沿 R2R-CE episode 的 reference_path 导航,
-  每一步采集 front/right/back/left 四个方向的 RGB + Depth + Pose.
+  每一步采集 front/right/back/left 四个方向的 RGB + Depth + Pose,
+  外加一个 pitch=30° 的 front_down 观测 (用于 pixel-goal 锚点).
+
+存储优化:
+  --depth-directions 控制哪些方向保存 depth (默认仅 front, 节省 ~65% 存储).
+  其余方向仅保存 RGB (JPEG) + Pose.
 
 输出格式 (per clip, chunks 模式):
   chunks/chunk_*.npz
     - frame_ids: [N] int32
-    - rgb_{front,right,back,left}: [N] object (JPEG bytes)
-    - depth_{front,right,back,left}: [N, H, W] float16
-    - pose_{front,right,back,left}: [N, 4, 4] float32
+    - rgb_{front,right,back,left,front_down}: [N] object (JPEG bytes)
+    - depth_{directions}: [N, H, W] float16  (仅 --depth-directions 指定的方向)
+    - pose_{front,right,back,left,front_down}: [N, 4, 4] float32
   trajectory_3d.npy     — [T, 3] float32, agent 3D 世界坐标
   actions.npy           — [T, 2] float32, agent-local (dx, dy)
   discrete_actions.npy  — [T] int32, HabitatSimActions
