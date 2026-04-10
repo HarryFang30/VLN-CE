@@ -90,7 +90,8 @@ def save_chunk_npz(
             _, buf = cv2.imencode(".jpg", rgb_by_dir[d][i], encode_params)
             jpg_list.append(buf.astype(np.uint8).ravel())
         chunk_dict[f"rgb_{d}"] = np.array(jpg_list, dtype=object)
-        chunk_dict[f"depth_{d}"] = depth_by_dir[d]
+        if d in depth_by_dir:
+            chunk_dict[f"depth_{d}"] = depth_by_dir[d]
         chunk_dict[f"pose_{d}"] = pose_by_dir[d]
     np.savez(chunk_path, **chunk_dict)
 
@@ -251,6 +252,11 @@ def parse_args():
     p.add_argument("--lookdown-pitch", type=float, default=LOOKDOWN_PITCH_DEG,
                    help="Pitch angle (degrees) for the extra lookdown observation. "
                         "Set to 0 to disable lookdown capture.")
+    p.add_argument("--depth-directions", type=str, nargs="+",
+                   default=["front"],
+                   help="Only save depth maps for these directions. "
+                        "Default: ['front'] (saves ~65%% storage). "
+                        "Use 'all' to save depth for every direction.")
     return p.parse_args()
 
 
@@ -258,6 +264,11 @@ def main():
     args = parse_args()
 
     lookdown_pitch = args.lookdown_pitch
+
+    if args.depth_directions == ["all"]:
+        depth_directions = None
+    else:
+        depth_directions = set(args.depth_directions)
 
     print("=" * 60)
     print("R2R-CE Panoramic Data Collection")
@@ -267,6 +278,8 @@ def main():
     print(f"  Clips:     {args.num_clips}")
     print(f"  Max steps: {args.max_steps}")
     print(f"  Lookdown:  {lookdown_pitch}°" if lookdown_pitch > 0 else "  Lookdown:  disabled")
+    depth_str = "all" if depth_directions is None else str(sorted(depth_directions))
+    print(f"  Depth for: {depth_str}")
     print(f"  Format:    chunks (4-view panoramic" +
           (f" + lookdown {lookdown_pitch}°)" if lookdown_pitch > 0 else ")"))
     print("=" * 60)
@@ -382,6 +395,11 @@ def main():
             if lookdown_pitch > 0:
                 all_capture_dirs.append(LOOKDOWN_DIRECTION)
 
+            save_depth_dirs = (
+                all_capture_dirs if depth_directions is None
+                else [d for d in all_capture_dirs if d in depth_directions]
+            )
+
             trajectory_3d = []
             front_poses_4x4 = []
             discrete_actions = []
@@ -389,7 +407,7 @@ def main():
             chunk_id = 0
             chunk_fids = []
             chunk_rgb = {d: [] for d in all_capture_dirs}
-            chunk_depth = {d: [] for d in all_capture_dirs}
+            chunk_depth = {d: [] for d in save_depth_dirs}
             chunk_pose = {d: [] for d in all_capture_dirs}
 
             def flush_chunk():
@@ -398,7 +416,7 @@ def main():
                     return
                 fids = np.array(chunk_fids, dtype=np.int32)
                 r = {d: np.stack(chunk_rgb[d]).astype(np.uint8, copy=False) for d in all_capture_dirs}
-                dp = {d: np.stack(chunk_depth[d]).astype(np.float16, copy=False) for d in all_capture_dirs}
+                dp = {d: np.stack(chunk_depth[d]).astype(np.float16, copy=False) for d in save_depth_dirs}
                 ps = {d: np.stack(chunk_pose[d]).astype(np.float32, copy=False) for d in all_capture_dirs}
                 path = str(chunks_dir / f"chunk_{chunk_id:05d}.npz")
                 submit_io_task(executor, io_futures, args.max_pending_io,
@@ -407,8 +425,9 @@ def main():
                 chunk_fids.clear()
                 for d in all_capture_dirs:
                     chunk_rgb[d].clear()
-                    chunk_depth[d].clear()
                     chunk_pose[d].clear()
+                for d in save_depth_dirs:
+                    chunk_depth[d].clear()
 
             def record_frame():
                 nonlocal frame_id
@@ -424,12 +443,13 @@ def main():
                         rgb = cv2.cvtColor(rgb, cv2.COLOR_RGBA2BGR)
                     elif rgb.shape[2] == 3:
                         rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-                    depth = mv[d]["depth"]
-                    if depth.dtype != np.float16:
-                        depth = depth.astype(np.float16)
                     chunk_rgb[d].append(rgb)
-                    chunk_depth[d].append(depth)
                     chunk_pose[d].append(mv[d]["pose"].astype(np.float32))
+                    if d in chunk_depth:
+                        depth = mv[d]["depth"]
+                        if depth.dtype != np.float16:
+                            depth = depth.astype(np.float16)
+                        chunk_depth[d].append(depth)
 
                 chunk_fids.append(frame_id)
                 frame_id += 1
@@ -501,11 +521,12 @@ def main():
                 "storage_format": "chunks",
                 "lookdown_pitch_deg": lookdown_pitch if lookdown_pitch > 0 else None,
                 "data_format": {
-                    "chunks": "NPZ: frame_ids + rgb/depth/pose for each direction",
+                    "chunks": "NPZ: frame_ids + rgb/pose per direction, depth only for depth_directions",
                     "trajectory_3d": "NPY float32 [T,3]",
                     "actions": "NPY float32 [T,2] agent-local (dx,dy)",
                     "discrete_actions": "NPY int32 [T] (0=STOP,1=FWD,2=LEFT,3=RIGHT)",
                     "directions": all_capture_dirs,
+                    "depth_directions": save_depth_dirs,
                 },
             }
             with open(clip_dir / "meta.json", "w") as f:
