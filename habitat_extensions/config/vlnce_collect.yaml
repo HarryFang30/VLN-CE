@@ -42,7 +42,7 @@ TASK:
 DATASET:
   TYPE: VLN-CE-v1
   SPLIT: train
-  DATA_PATH: /workspace/R2R_VLNCE_v1-3_preprocessed/{split}/{split}.json.gz
-  # Matterport3D 目录：/dataset/mp3d/<scene_id>/<scene_id>.glb
-  # 数据集中 scene_id 格式为 mp3d/xxx/xxx.glb，故 SCENES_DIR 需为 /dataset/
-  SCENES_DIR: /data/
+  # 相对仓库根目录；运行前 cwd 需在仓库根或见各脚本 chdir
+  DATA_PATH: data/datasets/R2R_VLNCE_v1-3_preprocessed/{split}/{split}.json.gz
+  # 与 habitat_extensions/task.py 中拼接逻辑一致：需为含 mp3d 的父目录（见 README：data/scene_datasets/mp3d）
+  SCENES_DIR: data/scene_datasets/
