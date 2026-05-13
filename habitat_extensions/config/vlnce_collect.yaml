@@ -10,17 +10,15 @@ SIMULATOR:
     GPU_DEVICE_ID: -1
     ALLOW_SLIDING: True
   RGB_SENSOR:
-    WIDTH: 640
-    HEIGHT: 480
+    WIDTH: 256
+    HEIGHT: 256
     HFOV: 90
-    SENSOR_SUBTYPE: PINHOLE
     POSITION: [0, 1.25, 0]
     TYPE: HabitatSimRGBSensor
   DEPTH_SENSOR:
-    WIDTH: 640
-    HEIGHT: 480
+    WIDTH: 256
+    HEIGHT: 256
     HFOV: 90
-    SENSOR_SUBTYPE: PINHOLE
     MIN_DEPTH: 0.0
     MAX_DEPTH: 10.0
     POSITION: [0, 1.25, 0]
@@ -44,5 +42,7 @@ TASK:
 DATASET:
   TYPE: VLN-CE-v1
   SPLIT: train
-  DATA_PATH: data/datasets/R2R_VLNCE_v1-3_preprocessed/{split}/{split}.json.gz
-  SCENES_DIR: data/scene_datasets/
+  DATA_PATH: /workspace/R2R_VLNCE_v1-3_preprocessed/{split}/{split}.json.gz
+  # Matterport3D 目录：/dataset/mp3d/<scene_id>/<scene_id>.glb
+  # 数据集中 scene_id 格式为 mp3d/xxx/xxx.glb，故 SCENES_DIR 需为 /dataset/
+  SCENES_DIR: /data/
