@@ -17,6 +17,8 @@
 #   VLNCE_CONDA_ENV    if set, conda activate this env after sourcing conda.sh
 #   VLNCE_NV_EGL_FIX   if set to a directory, enable NVIDIA EGL overlay (see below)
 #   HEATMAP_CONFIG     default: habitat_extensions/config/vlnce_collect.yaml
+#   HEATMAP_NUM_WAYPOINTS   if set, passed as --num-waypoints (int)
+#   HEATMAP_STORAGE_FORMAT  if set, passed as --storage-format (e.g. chunks)
 #   CUDA_VISIBLE_DEVICES  passed through when set (e.g. bind physical GPU)
 #
 # NVIDIA EGL overlay (optional, same idea as panoramic launcher on fixed-driver hosts):
@@ -27,6 +29,9 @@
 #   export VLNCE_CONDA_ENV=dataset_collect
 #   export CONDA_BASE=/opt/conda
 #   ./run_collect_heatmap.sh ./data/collected/heatmap_train_data 5000 0
+#
+# val_unseen 划分（5 个位置参数：含 waypoints / storage）请用:
+#   ./run_collect_heatmap_val_unseen.sh [OUTPUT] [NUM_CLIPS] [NUM_WAYPOINTS] [STORAGE_FORMAT] [GPU]
 #
 set -euo pipefail
 
@@ -57,6 +62,12 @@ echo "Output:            $OUTPUT"
 echo "Num clips:         $NUM_CLIPS"
 echo "Habitat gpu:       $HABITAT_GPU"
 echo "Config:            $HEATMAP_CONFIG"
+if [ -n "${HEATMAP_NUM_WAYPOINTS:-}" ]; then
+  echo "Num waypoints:     $HEATMAP_NUM_WAYPOINTS (via HEATMAP_NUM_WAYPOINTS)"
+fi
+if [ -n "${HEATMAP_STORAGE_FORMAT:-}" ]; then
+  echo "Storage format:    $HEATMAP_STORAGE_FORMAT (via HEATMAP_STORAGE_FORMAT)"
+fi
 echo "Log file:          $LOG_FILE"
 echo "============================================================"
 
@@ -159,11 +170,20 @@ echo "============================================================"
 
 cd "$PROJECT_DIR"
 
+HEATMAP_PY_ARGS=()
+if [ -n "${HEATMAP_NUM_WAYPOINTS:-}" ]; then
+  HEATMAP_PY_ARGS+=(--num-waypoints "${HEATMAP_NUM_WAYPOINTS}")
+fi
+if [ -n "${HEATMAP_STORAGE_FORMAT:-}" ]; then
+  HEATMAP_PY_ARGS+=(--storage-format "${HEATMAP_STORAGE_FORMAT}")
+fi
+
 python -m collect heatmap \
   --config "$HEATMAP_CONFIG" \
   --output "$OUTPUT" \
   --num-clips "$NUM_CLIPS" \
-  --gpu "$HABITAT_GPU"
+  --gpu "$HABITAT_GPU" \
+  "${HEATMAP_PY_ARGS[@]}"
 
 echo "============================================================"
 echo "[DONE] Heatmap collection finished"
