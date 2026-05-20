@@ -21,7 +21,6 @@ R2R-CE 全景数据采集 (Panoramic Collection)
 """
 import argparse
 import json
-import random
 import shutil
 import time
 import concurrent.futures
@@ -117,15 +116,6 @@ def main():
         episodes_by_scene.setdefault(scene, []).append(i)
     print(f"Scenes: {len(episodes_by_scene)}")
 
-    scene_names = list(episodes_by_scene.keys())
-    random.seed(42)
-    random.shuffle(scene_names)
-    all_indices = []
-    for s in scene_names:
-        eps = list(episodes_by_scene[s])
-        random.shuffle(eps)
-        all_indices.extend(eps)
-
     # ==================== 断点续采 ====================
     output_root = Path(args.output)
     split_dir = output_root / args.split
@@ -134,9 +124,11 @@ def main():
     collected_ids = set()
     for mf in split_dir.rglob("meta.json"):
         try:
-            eid = json.load(open(mf)).get("episode_id")
-            if eid is not None:
-                collected_ids.add(str(eid))
+            meta = json.load(open(mf))
+            eid = meta.get("episode_id")
+            scene = meta.get("scene_id")
+            if eid is not None and scene is not None:
+                collected_ids.add(f"{scene}:{eid}")
         except Exception:
             pass
     if collected_ids:
@@ -159,38 +151,43 @@ def main():
     io_futures: List[concurrent.futures.Future] = []
 
     start_time = time.time()
-    ep_ptr = 0
+    seen_reset_keys = set()
 
-    # ==================== 主采集循环 ====================
-    while clip_id <= args.num_clips and ep_ptr < len(all_indices):
-        episode_idx = all_indices[ep_ptr]
-        ep_ptr += 1
-        episode = dataset.episodes[episode_idx]
-
-        if str(episode.episode_id) in collected_ids:
-            continue
-
-        scene_name = episode.scene_id.split("/")[-1].replace(".glb", "")
-        print(f"\nClip {clip_id}/{args.num_clips}  scene={scene_name}  ep={episode.episode_id}")
-
-        ok = True
-        if episode.goals is None or len(episode.goals) == 0:
-            ok = False
-        if episode.reference_path is None or len(episode.reference_path) == 0:
-            ok = False
-        if not ok:
-            print("  Skip: missing goals/reference_path")
-            stats["failed"] += 1
-            continue
-
-        instruction_text = ""
-        if episode.instruction is not None and hasattr(episode.instruction, "instruction_text"):
-            instruction_text = episode.instruction.instruction_text or ""
-        trajectory_id = getattr(episode, "trajectory_id", None) or "unknown"
-
+    # ==================== 主采集循环 (reset-driven) ====================
+    while clip_id <= args.num_clips:
         try:
-            env._current_episode = episode
             observations = env.reset()
+            episode = env.current_episode
+
+            scene_name = episode.scene_id.split("/")[-1].replace(".glb", "")
+            ep_key = f"{scene_name}:{episode.episode_id}"
+
+            if ep_key in seen_reset_keys:
+                print("  Stop: Habitat episode iterator cycled through all episodes")
+                break
+            seen_reset_keys.add(ep_key)
+
+            if ep_key in collected_ids:
+                print(f"  Skip already collected episode {episode.episode_id}")
+                continue
+
+            print(f"\nClip {clip_id}/{args.num_clips}  scene={scene_name}  ep={episode.episode_id}")
+
+            ok = True
+            if episode.goals is None or len(episode.goals) == 0:
+                ok = False
+            if episode.reference_path is None or len(episode.reference_path) == 0:
+                ok = False
+            if not ok:
+                print("  Skip: missing goals/reference_path")
+                stats["failed"] += 1
+                continue
+
+            instruction_text = ""
+            if episode.instruction is not None and hasattr(episode.instruction, "instruction_text"):
+                instruction_text = episode.instruction.instruction_text or ""
+            trajectory_id = getattr(episode, "trajectory_id", None) or "unknown"
+
             sim = env.sim
             if not hasattr(env, "_last_scene") or env._last_scene != scene_name:
                 follower = ShortestPathFollower(sim, goal_radius=0.2, return_one_hot=False)
@@ -332,7 +329,7 @@ def main():
             with open(clip_dir / "meta.json", "w") as f:
                 json.dump(meta, f, indent=2)
 
-            collected_ids.add(str(episode.episode_id))
+            collected_ids.add(ep_key)
             stats["successful"] += 1
             stats["total_frames"] += frame_id
             stats["scenes"][scene_name] = stats["scenes"].get(scene_name, 0) + 1
