@@ -155,6 +155,7 @@ def main():
 
     # ==================== 主采集循环 (reset-driven) ====================
     while clip_id <= args.num_clips:
+        clip_dir = None
         try:
             observations = env.reset()
             episode = env.current_episode
@@ -339,7 +340,7 @@ def main():
         except Exception as e:
             print(f"  Failed: {e}")
             stats["failed"] += 1
-            if "clip_dir" in locals() and Path(clip_dir).exists():
+            if clip_dir is not None and Path(clip_dir).exists():
                 shutil.rmtree(clip_dir, ignore_errors=True)
 
     # ==================== 收尾 ====================
