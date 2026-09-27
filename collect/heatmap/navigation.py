@@ -11,10 +11,14 @@ def check_path_exists(
     sim,
     start: np.ndarray,
     end: np.ndarray,
-    max_detour_ratio: float = 5.0,
+    max_detour_ratio: float = 2.0,
 ) -> bool:
     """
     检查两点之间是否存在可达路径（测地距离 / 直线距离 <= max_detour_ratio）。
+
+    A bounded detour is important for closed patrols: very long geodesic
+    detours between nearby Euclidean points otherwise exhaust the route step
+    budget before the agent can revisit its start.
     """
     import habitat_sim
 

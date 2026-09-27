@@ -2,6 +2,7 @@
 IO 工具：异步任务调度、chunk 存储、日志重定向
 """
 import sys
+import os
 import cv2
 import numpy as np
 import concurrent.futures
@@ -44,9 +45,11 @@ def submit_io_task(
     """提交异步 IO 任务，队列超过 max_pending 时回收已完成任务。"""
     io_futures.append(executor.submit(fn, *args))
     if len(io_futures) >= max_pending:
-        _, not_done = concurrent.futures.wait(
+        done, not_done = concurrent.futures.wait(
             io_futures, return_when=concurrent.futures.FIRST_COMPLETED,
         )
+        for future in done:
+            future.result()
         io_futures[:] = list(not_done)
 
 
@@ -54,7 +57,9 @@ def drain_io_futures(io_futures: List[concurrent.futures.Future]):
     """等待所有异步 IO 任务完成并清空列表"""
     if io_futures:
         print(f"Waiting for {len(io_futures)} pending IO operations...")
-        concurrent.futures.wait(io_futures)
+        done, _ = concurrent.futures.wait(io_futures)
+        for future in done:
+            future.result()
         io_futures.clear()
         print("All IO completed")
 
@@ -85,14 +90,24 @@ def save_chunk_npz(
     for d in rgb_by_dir:
         jpg_list = []
         for i in range(len(rgb_by_dir[d])):
-            _, buf = cv2.imencode(".jpg", rgb_by_dir[d][i], encode_params)
+            ok, buf = cv2.imencode(".jpg", rgb_by_dir[d][i], encode_params)
+            if not ok:
+                raise IOError(f"JPEG encode failed: direction={d}, index={i}")
             jpg_list.append(buf.astype(np.uint8).ravel())
         chunk_dict[f"rgb_{d}"] = np.array(jpg_list, dtype=object)
         if d in depth_by_dir:
             chunk_dict[f"depth_{d}"] = depth_by_dir[d]
         chunk_dict[f"pose_{d}"] = pose_by_dir[d]
 
-    np.savez(chunk_path, **chunk_dict)
+    # Atomic replace keeps interrupted writes from looking like valid chunks.
+    temp_path = f"{chunk_path}.tmp"
+    try:
+        with open(temp_path, "wb") as f:
+            np.savez(f, **chunk_dict)
+        os.replace(temp_path, chunk_path)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def save_image_async(path: Path, image: np.ndarray) -> bool:

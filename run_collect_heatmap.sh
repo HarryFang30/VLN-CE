@@ -1,189 +1,168 @@
 #!/usr/bin/env bash
-# ============================================================
-# VLN-CE Heatmap (multi-waypoint patrol) collection launcher
-# Same layout style as run_collect_panoramic (conda / EGL optional).
-# ============================================================
-#
-# Usage (from anywhere):
-#   ./run_collect_heatmap.sh [OUTPUT_DIR] [NUM_CLIPS] [HABITAT_GPU]
-#
-# Defaults (relative to this repo root):
-#   OUTPUT_DIR  -> <repo>/data/collected/heatmap_train_data
-#   NUM_CLIPS   -> 1000
-#   HABITAT_GPU -> 0
-#
-# Optional environment (server-specific, not hardcoded):
-#   CONDA_BASE         default: $HOME/miniconda3 (also tries Miniforge3)
-#   VLNCE_CONDA_ENV    if set, conda activate this env after sourcing conda.sh
-#   VLNCE_NV_EGL_FIX   if set to a directory, enable NVIDIA EGL overlay (see below)
-#   HEATMAP_CONFIG     default: habitat_extensions/config/vlnce_collect.yaml
-#   HEATMAP_NUM_WAYPOINTS   if set, passed as --num-waypoints (int)
-#   HEATMAP_STORAGE_FORMAT  if set, passed as --storage-format (e.g. chunks)
-#   CUDA_VISIBLE_DEVICES  passed through when set (e.g. bind physical GPU)
-#
-# NVIDIA EGL overlay (optional, same idea as panoramic launcher on fixed-driver hosts):
-#   export VLNCE_NV_EGL_FIX=/path/to/nv-egl-fix
-# Expect under that directory: local-lib/, NVIDIA-Linux-.../, 10_nvidia_local.json
-#
-# Example:
-#   export VLNCE_CONDA_ENV=dataset_collect
-#   export CONDA_BASE=/opt/conda
-#   ./run_collect_heatmap.sh ./data/collected/heatmap_train_data 5000 0
-#
-# val_unseen 划分（5 个位置参数：含 waypoints / storage）请用:
-#   ./run_collect_heatmap_val_unseen.sh [OUTPUT] [NUM_CLIPS] [NUM_WAYPOINTS] [STORAGE_FORMAT] [GPU]
-#
 set -euo pipefail
 
+# Heatmap patrol collection on finn_cci_c500.
+# Rendering is CPU/GLX (Mesa llvmpipe); the MetaX accelerators are not used.
+
+ALLOWED_ROOT="/mnt/afs/lixiaoou/intern/fjl"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 PROJECT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+CONDA_SH="${CONDA_SH:-/opt/conda/etc/profile.d/conda.sh}"
+CONDA_ENV="${VLNCE_CONDA_ENV:-${ALLOWED_ROOT}/envs/vlnce}"
 
-# --- positional args (heatmap has no --split; split comes from HEATMAP_CONFIG / yaml) ---
-DEFAULT_OUTPUT="${PROJECT_DIR}/data/collected/heatmap_train_data"
+DEFAULT_OUTPUT="${ALLOWED_ROOT}/data/heatmap_randomwalk_pilot_v1"
 OUTPUT="${1:-$DEFAULT_OUTPUT}"
-NUM_CLIPS="${2:-1000}"
-HABITAT_GPU="${3:-0}"
+NUM_CLIPS="${2:-20}"
+NUM_WAYPOINTS="${3:-4}"
+STORAGE_FORMAT="${4:-chunks}"
+HABITAT_GPU="${5:-0}"
 
+HEATMAP_CONFIG="${HEATMAP_CONFIG:-${PROJECT_DIR}/habitat_extensions/config/vlnce_collect.yaml}"
+HEATMAP_SEED="${HEATMAP_SEED:-42}"
+HEATMAP_MIN_WAYPOINT_DIST="${HEATMAP_MIN_WAYPOINT_DIST:-2.0}"
+HEATMAP_MAX_WAYPOINT_DIST="${HEATMAP_MAX_WAYPOINT_DIST:-10.0}"
+HEATMAP_MAX_STEPS="${HEATMAP_MAX_STEPS:-500}"
+HEATMAP_MIN_FRAMES="${HEATMAP_MIN_FRAMES:-30}"
+HEATMAP_MIN_KEYFRAME_TRANSLATION="${HEATMAP_MIN_KEYFRAME_TRANSLATION:-0.20}"
+VLNCE_DISPLAY="${VLNCE_DISPLAY:-localhost:200.0}"
+HEATMAP_WORKER_ID="${HEATMAP_WORKER_ID:-0}"
+HEATMAP_CLIP_ID_START="${HEATMAP_CLIP_ID_START:-0}"
+HEATMAP_STATS_FILE="${HEATMAP_STATS_FILE:-collection_stats.json}"
+HEATMAP_IO_WORKERS="${HEATMAP_IO_WORKERS:-4}"
+HEATMAP_MAX_PENDING_IO="${HEATMAP_MAX_PENDING_IO:-64}"
+HEATMAP_RENDER_THREADS="${HEATMAP_RENDER_THREADS:-4}"
+HEATMAP_EPISODE_SHARD_ID="${HEATMAP_EPISODE_SHARD_ID:-0}"
+HEATMAP_EPISODE_SHARD_COUNT="${HEATMAP_EPISODE_SHARD_COUNT:-1}"
+HEATMAP_EPISODE_OFFSET="${HEATMAP_EPISODE_OFFSET:-0}"
+HEATMAP_SCENE_BLOCK_SIZE="${HEATMAP_SCENE_BLOCK_SIZE:-8}"
+
+canonical_path() {
+  realpath -m "$1"
+}
+
+assert_under_allowed_root() {
+  local label="$1"
+  local resolved
+  resolved="$(canonical_path "$2")"
+  case "$resolved" in
+    "$ALLOWED_ROOT"|"$ALLOWED_ROOT"/*) ;;
+    *)
+      echo "[ERROR] ${label} escapes allowed root ${ALLOWED_ROOT}: ${resolved}" >&2
+      exit 1
+      ;;
+  esac
+}
+
+assert_under_allowed_root "project" "$PROJECT_DIR"
+assert_under_allowed_root "output" "$OUTPUT"
+assert_under_allowed_root "config" "$HEATMAP_CONFIG"
+assert_under_allowed_root "conda env" "$CONDA_ENV"
+
+if [[ "$HABITAT_GPU" != "0" ]]; then
+  echo "[ERROR] CPU/GLX Habitat rendering requires logical device 0, got ${HABITAT_GPU}." >&2
+  exit 1
+fi
+if [[ ! -f "$CONDA_SH" ]]; then
+  echo "[ERROR] conda.sh not found: $CONDA_SH" >&2
+  exit 1
+fi
+if [[ ! -f "$HEATMAP_CONFIG" ]]; then
+  echo "[ERROR] collection config not found: $HEATMAP_CONFIG" >&2
+  exit 1
+fi
+
+OUTPUT="$(canonical_path "$OUTPUT")"
 LOG_DIR="${PROJECT_DIR}/logs"
-LOG_FILE="${LOG_DIR}/collect_heatmap_${NUM_CLIPS}_$(date +%Y%m%d_%H%M%S).log"
-
-HEATMAP_CONFIG="${HEATMAP_CONFIG:-habitat_extensions/config/vlnce_collect.yaml}"
-
-mkdir -p "$LOG_DIR"
-mkdir -p "$OUTPUT"
-
+LOG_FILE="${LOG_DIR}/collect_heatmap_w${HEATMAP_WORKER_ID}_${NUM_CLIPS}_wp${NUM_WAYPOINTS}_$(date +%Y%m%d_%H%M%S).log"
+mkdir -p "$LOG_DIR" "$OUTPUT"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
 echo "============================================================"
-echo "VLN-CE Heatmap Collection Launcher"
+echo "VLN-CE Heatmap Patrol Collection (CPU/GLX)"
 echo "============================================================"
 echo "Project dir:       $PROJECT_DIR"
 echo "Output:            $OUTPUT"
-echo "Num clips:         $NUM_CLIPS"
-echo "Habitat gpu:       $HABITAT_GPU"
 echo "Config:            $HEATMAP_CONFIG"
-if [ -n "${HEATMAP_NUM_WAYPOINTS:-}" ]; then
-  echo "Num waypoints:     $HEATMAP_NUM_WAYPOINTS (via HEATMAP_NUM_WAYPOINTS)"
-fi
-if [ -n "${HEATMAP_STORAGE_FORMAT:-}" ]; then
-  echo "Storage format:    $HEATMAP_STORAGE_FORMAT (via HEATMAP_STORAGE_FORMAT)"
-fi
+echo "Num clips target:  $NUM_CLIPS"
+echo "Num waypoints:     $NUM_WAYPOINTS"
+echo "Waypoint distance: ${HEATMAP_MIN_WAYPOINT_DIST}m ~ ${HEATMAP_MAX_WAYPOINT_DIST}m"
+echo "Max steps:         $HEATMAP_MAX_STEPS"
+echo "Min frames:        $HEATMAP_MIN_FRAMES"
+echo "Keyframe move:     $HEATMAP_MIN_KEYFRAME_TRANSLATION m"
+echo "Storage format:    $STORAGE_FORMAT"
+echo "Seed:              $HEATMAP_SEED"
+echo "Worker id:         $HEATMAP_WORKER_ID"
+echo "Clip id start:     $HEATMAP_CLIP_ID_START"
+echo "Stats file:        $HEATMAP_STATS_FILE"
+echo "Episode shard:     $HEATMAP_EPISODE_SHARD_ID/$HEATMAP_EPISODE_SHARD_COUNT"
+echo "Episode offset:    $HEATMAP_EPISODE_OFFSET"
+echo "Scene block size:  $HEATMAP_SCENE_BLOCK_SIZE"
+echo "Display:           $VLNCE_DISPLAY"
 echo "Log file:          $LOG_FILE"
 echo "============================================================"
 
-# ------------------------------------------------------------
-# 1. Optional conda (only if VLNCE_CONDA_ENV is set)
-# ------------------------------------------------------------
-CONDA_BASE="${CONDA_BASE:-}"
-if [ -z "$CONDA_BASE" ]; then
-  if [ -d "$HOME/miniconda3" ]; then
-    CONDA_BASE="$HOME/miniconda3"
-  elif [ -d "$HOME/Miniforge3" ]; then
-    CONDA_BASE="$HOME/Miniforge3"
-  elif [ -d "$HOME/anaconda3" ]; then
-    CONDA_BASE="$HOME/anaconda3"
-  fi
+# shellcheck source=/dev/null
+source "$CONDA_SH"
+conda activate "$CONDA_ENV"
+
+if [[ "$(command -v python)" != "${CONDA_ENV}/bin/python" ]]; then
+  echo "[ERROR] wrong Python after conda activate: $(command -v python)" >&2
+  exit 1
 fi
 
-if [ -n "${VLNCE_CONDA_ENV:-}" ]; then
-  if [ -z "$CONDA_BASE" ] || [ ! -f "${CONDA_BASE}/etc/profile.d/conda.sh" ]; then
-    echo "[ERROR] VLNCE_CONDA_ENV is set but conda.sh not found."
-    echo "        Set CONDA_BASE to your Miniconda/Anaconda root, e.g."
-    echo "        export CONDA_BASE=/path/to/miniconda3"
-    exit 1
-  fi
-  # shellcheck source=/dev/null
-  source "${CONDA_BASE}/etc/profile.d/conda.sh"
-  conda activate "$VLNCE_CONDA_ENV"
-  echo "[INFO] Conda env:      ${CONDA_DEFAULT_ENV:-}"
-  echo "[INFO] Python:         $(command -v python)"
-  echo "[INFO] Python version: $(python --version)"
-else
-  echo "[INFO] Skipping conda activate (set VLNCE_CONDA_ENV to enable)."
-  echo "[INFO] Python:         $(command -v python || echo 'python not found')"
+# Habitat-Sim 0.1.7 uses a GLX context on this host.  Exposing one logical
+# device avoids its multi-GPU GLX guard; glxinfo confirms the renderer itself
+# is Mesa llvmpipe, not a MetaX/NVIDIA accelerator.
+export DISPLAY="$VLNCE_DISPLAY"
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export CUDA_VISIBLE_DEVICES=0
+export LP_NUM_THREADS="$HEATMAP_RENDER_THREADS"
+export OMP_NUM_THREADS="$HEATMAP_RENDER_THREADS"
+# Habitat-Sim 0.1.7 can occasionally abort inside its native GLX renderer.
+# Do not leave multi-gigabyte core files in the collection tree; the parallel
+# launcher retries the worker with the same id range instead.
+ulimit -c 0
+unset WAYLAND_DISPLAY EGL_PLATFORM __EGL_VENDOR_LIBRARY_FILENAMES
+unset LIBGL_ALWAYS_INDIRECT MESA_LOADER_DRIVER_OVERRIDE LIBGL_DRIVERS_PATH
+
+echo "[INFO] Conda env:      ${CONDA_DEFAULT_ENV:-}"
+echo "[INFO] Python:         $(command -v python)"
+echo "[INFO] Python version: $(python --version)"
+echo "[INFO] OpenGL renderer:"
+if ! glxinfo -B 2>&1 | grep -E "OpenGL (vendor|renderer) string|direct rendering"; then
+  echo "[ERROR] GLX display is not usable: DISPLAY=$DISPLAY" >&2
+  exit 1
 fi
-
-# ------------------------------------------------------------
-# 2. Optional headless NVIDIA EGL (VLNCE_NV_EGL_FIX)
-# ------------------------------------------------------------
-if [ -n "${VLNCE_NV_EGL_FIX:-}" ]; then
-  NV_EGL_LIB="${VLNCE_NV_EGL_LIB:-${VLNCE_NV_EGL_FIX}/local-lib}"
-  NV_RUNFILE="${VLNCE_NV_RUNFILE:-}"
-  if [ -z "$NV_RUNFILE" ]; then
-    # First matching extracted driver dir under the fix root
-    NV_RUNFILE="$(find "$VLNCE_NV_EGL_FIX" -maxdepth 1 -type d -name 'NVIDIA-Linux-x86_64-*' 2>/dev/null | head -1 || true)"
-  fi
-  NV_EGL_VENDOR="${VLNCE_NV_EGL_VENDOR:-${VLNCE_NV_EGL_FIX}/10_nvidia_local.json}"
-
-  unset DISPLAY || true
-  unset WAYLAND_DISPLAY || true
-  unset EGL_PLATFORM || true
-  unset LIBGL_ALWAYS_INDIRECT || true
-  unset MESA_LOADER_DRIVER_OVERRIDE || true
-  unset LIBGL_DRIVERS_PATH || true
-
-  export CUDA_DEVICE_ORDER="${CUDA_DEVICE_ORDER:-PCI_BUS_ID}"
-
-  if [ ! -d "$NV_EGL_LIB" ]; then
-    echo "[ERROR] Missing NVIDIA EGL local lib dir: $NV_EGL_LIB"
-    exit 1
-  fi
-  if [ -z "$NV_RUNFILE" ] || [ ! -d "$NV_RUNFILE" ]; then
-    echo "[ERROR] Missing NVIDIA runfile dir under VLNCE_NV_EGL_FIX (set VLNCE_NV_RUNFILE)."
-    exit 1
-  fi
-  if [ ! -f "$NV_EGL_VENDOR" ]; then
-    echo "[ERROR] Missing NVIDIA EGL vendor file: $NV_EGL_VENDOR"
-    exit 1
-  fi
-  if [ ! -e "$NV_EGL_LIB/libEGL_nvidia.so.0" ]; then
-    echo "[ERROR] Missing local libEGL_nvidia.so.0 in $NV_EGL_LIB"
-    exit 1
-  fi
-
-  export LD_LIBRARY_PATH="${NV_EGL_LIB}:${NV_RUNFILE}:${LD_LIBRARY_PATH:-}"
-  export __EGL_VENDOR_LIBRARY_FILENAMES="$NV_EGL_VENDOR"
-
-  echo "[INFO] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
-  echo "[INFO] EGL vendor file: ${__EGL_VENDOR_LIBRARY_FILENAMES}"
-  echo "[INFO] NVIDIA EGL lib:  ${NV_EGL_LIB}"
-  echo "[INFO] NVIDIA runfile:  ${NV_RUNFILE}"
-else
-  echo "[INFO] VLNCE_NV_EGL_FIX unset — using system GL/EGL (set it for fixed-driver EGL setups)."
-fi
-
-echo "============================================================"
-echo "[CHECK] NVIDIA driver (if nvidia-smi available)"
-nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null || echo "(nvidia-smi not available or not NVIDIA host)"
-
-echo "============================================================"
-echo "[CHECK] OpenCV import"
-python - <<'PY'
-import cv2
-print("cv2 OK:", cv2.__version__)
-print("cv2 file:", cv2.__file__)
-PY
-
-echo "============================================================"
-echo "[RUN] Start heatmap collection"
-echo "============================================================"
 
 cd "$PROJECT_DIR"
 
-HEATMAP_PY_ARGS=()
-if [ -n "${HEATMAP_NUM_WAYPOINTS:-}" ]; then
-  HEATMAP_PY_ARGS+=(--num-waypoints "${HEATMAP_NUM_WAYPOINTS}")
+COLLECT_ARGS=(
+  -m collect heatmap
+  --config "$HEATMAP_CONFIG"
+  --output "$OUTPUT"
+  --num-clips "$NUM_CLIPS"
+  --num-waypoints "$NUM_WAYPOINTS"
+  --min-waypoint-dist "$HEATMAP_MIN_WAYPOINT_DIST"
+  --max-waypoint-dist "$HEATMAP_MAX_WAYPOINT_DIST"
+  --max-steps "$HEATMAP_MAX_STEPS"
+  --min-frames "$HEATMAP_MIN_FRAMES"
+  --min-keyframe-translation "$HEATMAP_MIN_KEYFRAME_TRANSLATION"
+  --num-workers "$HEATMAP_IO_WORKERS"
+  --max-pending-io "$HEATMAP_MAX_PENDING_IO"
+  --storage-format "$STORAGE_FORMAT"
+  --seed "$HEATMAP_SEED"
+  --worker-id "$HEATMAP_WORKER_ID"
+  --episode-shard-id "$HEATMAP_EPISODE_SHARD_ID"
+  --episode-shard-count "$HEATMAP_EPISODE_SHARD_COUNT"
+  --episode-offset "$HEATMAP_EPISODE_OFFSET"
+  --scene-block-size "$HEATMAP_SCENE_BLOCK_SIZE"
+  --stats-file "$HEATMAP_STATS_FILE"
+  --gpu "$HABITAT_GPU"
+)
+if [[ "$HEATMAP_CLIP_ID_START" -gt 0 ]]; then
+  COLLECT_ARGS+=(--clip-id-start "$HEATMAP_CLIP_ID_START")
 fi
-if [ -n "${HEATMAP_STORAGE_FORMAT:-}" ]; then
-  HEATMAP_PY_ARGS+=(--storage-format "${HEATMAP_STORAGE_FORMAT}")
-fi
-
-python -m collect heatmap \
-  --config "$HEATMAP_CONFIG" \
-  --output "$OUTPUT" \
-  --num-clips "$NUM_CLIPS" \
-  --gpu "$HABITAT_GPU" \
-  "${HEATMAP_PY_ARGS[@]}"
+python "${COLLECT_ARGS[@]}"
 
 echo "============================================================"
 echo "[DONE] Heatmap collection finished"

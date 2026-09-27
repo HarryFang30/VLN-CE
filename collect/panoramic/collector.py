@@ -23,6 +23,7 @@ import argparse
 import json
 import shutil
 import time
+import zlib
 import concurrent.futures
 from pathlib import Path
 from typing import List
@@ -71,7 +72,23 @@ def parse_args():
                    help="Pitch angle for extra lookdown view. 0 to disable.")
     p.add_argument("--depth-directions", type=str, nargs="+", default=["front"],
                    help="Directions to save depth for. Use 'all' for every direction.")
+    # Parallel sharding.  Workers share one output root: each owns the
+    # episodes whose stable hash falls in its residue class, plus a disjoint
+    # clip-id block, so two workers can never write the same clip directory.
+    p.add_argument("--episode-modulo", type=int, default=1,
+                   help="Collect only episodes with crc32(scene:episode) %% modulo == remainder.")
+    p.add_argument("--episode-remainder", type=int, default=0,
+                   help="This worker's residue class in [0, episode-modulo).")
+    p.add_argument("--clip-id-start", type=int, default=0,
+                   help="First clip id owned by this worker; 0 keeps the legacy global auto-resume.")
+    p.add_argument("--clip-id-end", type=int, default=0,
+                   help="Last clip id owned by this worker; 0 uses --num-clips.")
     return p.parse_args()
+
+
+def episode_shard_of(ep_key: str, modulo: int) -> int:
+    """Stable cross-process shard assignment for one scene:episode key."""
+    return zlib.crc32(ep_key.encode("utf-8")) % modulo
 
 
 def main():
@@ -79,6 +96,16 @@ def main():
 
     lookdown_pitch = args.lookdown_pitch
     depth_directions = None if args.depth_directions == ["all"] else set(args.depth_directions)
+    episode_modulo = int(args.episode_modulo)
+    episode_remainder = int(args.episode_remainder)
+    if episode_modulo < 1:
+        raise ValueError("--episode-modulo must be >= 1")
+    if not 0 <= episode_remainder < episode_modulo:
+        raise ValueError("--episode-remainder must be in [0, --episode-modulo)")
+    clip_id_start = int(args.clip_id_start)
+    clip_id_end = int(args.clip_id_end) if args.clip_id_end else int(args.num_clips)
+    if clip_id_start < 0 or clip_id_end < max(clip_id_start, 1):
+        raise ValueError("--clip-id-start/--clip-id-end define an empty clip range")
 
     print("=" * 60)
     print("R2R-CE Panoramic Data Collection")
@@ -90,6 +117,9 @@ def main():
     print(f"  Lookdown:  {lookdown_pitch}°" if lookdown_pitch > 0 else "  Lookdown:  disabled")
     depth_str = "all" if depth_directions is None else str(sorted(depth_directions))
     print(f"  Depth for: {depth_str}")
+    if episode_modulo > 1:
+        print(f"  Shard:     {episode_remainder}/{episode_modulo} "
+              f"(clip ids {clip_id_start or 1}..{clip_id_end})")
     print("=" * 60)
 
     # ==================== 环境初始化 ====================
@@ -134,17 +164,21 @@ def main():
     if collected_ids:
         print(f"Resuming: {len(collected_ids)} episodes already collected")
 
+    # Resume clip numbering.  A sharded worker only ever considers ids inside
+    # its own [clip_id_start, clip_id_end] block, so parallel workers resume
+    # independently and can never renumber into another worker's block.
     existing_clips = list(split_dir.rglob("meta.json"))
-    if existing_clips:
-        max_id = 0
-        for mf in existing_clips:
-            try:
-                max_id = max(max_id, int(mf.parent.name.split("_")[1]))
-            except Exception:
-                pass
-        clip_id = max_id + 1
-    else:
-        clip_id = 1
+    range_low = clip_id_start if clip_id_start > 0 else 1
+    max_id = 0
+    for mf in existing_clips:
+        try:
+            existing_id = int(mf.parent.name.split("_")[1])
+        except Exception:
+            continue
+        if clip_id_start > 0 and not range_low <= existing_id <= clip_id_end:
+            continue
+        max_id = max(max_id, existing_id)
+    clip_id = max(range_low, max_id + 1)
 
     stats = {"successful": 0, "failed": 0, "total_frames": 0, "scenes": {}}
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=args.num_workers)
@@ -154,7 +188,7 @@ def main():
     seen_reset_keys = set()
 
     # ==================== 主采集循环 (reset-driven) ====================
-    while clip_id <= args.num_clips:
+    while clip_id <= clip_id_end:
         clip_dir = None
         try:
             observations = env.reset()
@@ -168,11 +202,17 @@ def main():
                 break
             seen_reset_keys.add(ep_key)
 
+            if (
+                episode_modulo > 1
+                and episode_shard_of(ep_key, episode_modulo) != episode_remainder
+            ):
+                continue
+
             if ep_key in collected_ids:
                 print(f"  Skip already collected episode {episode.episode_id}")
                 continue
 
-            print(f"\nClip {clip_id}/{args.num_clips}  scene={scene_name}  ep={episode.episode_id}")
+            print(f"\nClip {clip_id}/{clip_id_end}  scene={scene_name}  ep={episode.episode_id}")
 
             ok = True
             if episode.goals is None or len(episode.goals) == 0:
